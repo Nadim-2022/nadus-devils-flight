@@ -1,4 +1,4 @@
-build
+build/
 .vscode/
 src/build/
 src/Test/

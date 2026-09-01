@@ -1,0 +1,6 @@
+build
+!.vscode/*
+src/build
+pico_sdk_import.cmake
+src/pico_sdk_import.cmake
+src/Test

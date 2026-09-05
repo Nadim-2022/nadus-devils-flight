@@ -41,7 +41,7 @@ project(nadus-devils-flight LANGUAGES C CXX ASM)
 pico_sdk_init()
 
 # 1. Build external sensor & driver libraries
-#add_subdirectory(external)
+add_subdirectory(external)
 
 # 2. Build main firmware and link everything
 add_subdirectory(src)

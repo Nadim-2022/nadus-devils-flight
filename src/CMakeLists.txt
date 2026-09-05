@@ -17,6 +17,7 @@ set(PICO_BOARD pico CACHE STRING "Board type")
 # Source files
 add_executable(${PROJECT_NAME}
         main.cpp
+        receiver/Elrs.cpp
 
 )
 
@@ -50,11 +51,12 @@ target_link_libraries(${PROJECT_NAME}
         FreeRTOS-Kernel-Heap4
         hardware_adc
         hardware_uart
+        hardware_spi
 )
 
 pico_add_extra_outputs(${PROJECT_NAME})
 
 
 # Enable usb output, disable uart output
-pico_enable_stdio_usb(${PROJECT_NAME} 1)
-pico_enable_stdio_uart(${PROJECT_NAME} 0)
+pico_enable_stdio_usb(${PROJECT_NAME} 0)
+pico_enable_stdio_uart(${PROJECT_NAME} 1)

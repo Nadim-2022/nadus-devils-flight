@@ -8,15 +8,17 @@
 #include "hardware/adc.h"
 #include "hardware/uart.h"
 #include "debug/debug.hpp"
+#include "hardware/spi.h"
+#include "receiver/Elrs.hpp"
 
 extern "C" {
     uint32_t read_runtime_ctr(void) { return timer_hw->timerawl; }
 }
 
-#define ELRS_UART uart0
+#define ELRS_UART uart1
 #define ELRS_BAUD 416666 //416666
-#define ELRS_TX_PIN 0
-#define ELRS_RX_PIN 1
+#define ELRS_TX_PIN 4
+#define ELRS_RX_PIN 5
 
 TaskHandle_t elrs_task_handle = NULL;
 TaskHandle_t core0_task_handle = NULL;
@@ -90,85 +92,11 @@ void core0_elrs_task(void *pvParameters) {
     (void)pvParameters;
     
     printf("[Core 0] ELRS CRSF Task Initialized at 420k Baud\n");
+    Receiver::Elrs elrs(ELRS_UART);
 
-    uint8_t rx_buffer[64];
-    uint8_t state = 0;
-    uint8_t payload_len = 0;
-    uint8_t index = 0;
-    
-    // Array to hold our final 11-bit channel values
-    uint16_t rc_channels[16] = {0}; 
-
-    while (true) {
-        while (uart_is_readable(ELRS_UART)) {
-            uint8_t rx_byte = uart_getc(ELRS_UART);
-
-            switch (state) {
-
-                case 0: // Looking for Sync Byte
-                    if (rx_byte == 0xC8) {
-                        state = 1;
-                    }
-                    break;
-                    
-                case 1: // Reading Length
-                    payload_len = rx_byte;
-                    // A standard RC channels packet length is 24 (Type + 22 Payload + CRC)
-                    if (payload_len == 24) { 
-                        index = 0;
-                        state = 2;
-                    } else {
-                        state = 0; // Invalid length for RC data, reset
-                    }
-                    break;
-                    
-                case 2: // Reading Type, Payload, and CRC
-                    rx_buffer[index++] = rx_byte;
-                    
-                    if (index == payload_len) {
-                        // The packet is fully received. Now verify it.
-                        uint8_t calculated_crc = crsf_crc8(rx_buffer, payload_len - 1);
-                        
-                        if (calculated_crc == rx_buffer[payload_len - 1] && rx_buffer[0] == 0x16) {
-                            // CRC matches and Type is 0x16 (RC Channels)
-                            // Skip rx_buffer[0] (Type), payload starts at rx_buffer[1]
-                            uint8_t *payload = &rx_buffer[1];
-
-                            // Unpack 10 channels (11 bits each)
-                            rc_channels[0] = (payload[0]       | payload[1] << 8)                     & 0x07FF;
-                            rc_channels[1] = (payload[1] >> 3  | payload[2] << 5)                     & 0x07FF;
-                            rc_channels[2] = (payload[2] >> 6  | payload[3] << 2  | payload[4] << 10) & 0x07FF;
-                            rc_channels[3] = (payload[4] >> 1  | payload[5] << 7)                     & 0x07FF;
-                            rc_channels[4] = (payload[5] >> 4  | payload[6] << 4)                     & 0x07FF;
-                            rc_channels[5] = (payload[6] >> 7  | payload[7] << 1  | payload[8] << 9)  & 0x07FF;
-                            rc_channels[6] = (payload[8] >> 2  | payload[9] << 6)                     & 0x07FF;
-                            rc_channels[7] = (payload[9] >> 5  | payload[10] << 3)                    & 0x07FF;
-                            
-                            // The bit-shifting pattern repeats every 8 channels (11 bytes)!
-                            rc_channels[8] = (payload[11]      | payload[12] << 8)                    & 0x07FF;
-                            rc_channels[9] = (payload[12] >> 3 | payload[13] << 5)                    & 0x07FF;
-                        
-                        
-                            // Optional: Map raw 172-1811 values to standard 1000-2000 PWM values
-                            // Button have lowest 191 and highest 1792, so we map that to 1000-2000 range for easier use in flight controllers
-                            for (int i = 0; i < 10; i++) {
-                                rc_channels[i] = map_val(rc_channels[i], 191, 1792, 1000, 2000);
-                            }
-                            
-                            // Print the first 10 channels
-                            DEBUG_PRINTF("CH1:%u CH2:%u CH3:%u CH4:%u CH5:%u CH6:%u CH7:%u CH8:%u CH9:%u CH10:%u\n", 
-                                rc_channels[0], rc_channels[1], rc_channels[2], rc_channels[3], 
-                                rc_channels[4], rc_channels[5], rc_channels[6], rc_channels[7],
-                                rc_channels[8], rc_channels[9]);
-
-                        }
-                        
-                        // Reset to catch the next packet
-                        state = 0; 
-                    }
-                    break;
-            }
-        }
+    while(1)
+    {
+        elrs.read_packet();
         
         // Yield to let other system tasks run
         vTaskDelay(pdMS_TO_TICKS(4));
@@ -177,10 +105,12 @@ void core0_elrs_task(void *pvParameters) {
 
 int main() {
     sleep_ms(2000);
+    
     // 1. Overclocking Sequence
     vreg_set_voltage(VREG_VOLTAGE_1_15);
     sleep_ms(10); 
     set_sys_clock_khz(300000, true);
+    
     // 2. Standard Initialization
     stdio_init_all();
     
@@ -199,8 +129,8 @@ int main() {
     DEBUG_PRINTF("Nadus Devil's Flight - Hardware Verification\n");
     DEBUG_PRINTF("========================================\n");
 
-    /*
     
+    /*
     xTaskCreate(
         core0_system_task, 
         "TempTask", 
@@ -210,6 +140,7 @@ int main() {
         &core0_task_handle 
     );
     */
+    
 
     xTaskCreate(
         core1_flight_task, 
@@ -231,13 +162,13 @@ int main() {
 
 
     vTaskCoreAffinitySet(elrs_task_handle, (1 << 0));
-   // vTaskCoreAffinitySet(core0_task_handle, (1 << 0));
+    //vTaskCoreAffinitySet(core0_task_handle, (1 << 0));
     vTaskCoreAffinitySet(core1_task_handle, (1 << 1));
 
     vTaskStartScheduler();
 
     while (true) {
-        tight_loop_contents();
+        //tight_loop_contents();
     }
     return 0;
 }

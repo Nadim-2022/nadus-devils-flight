@@ -18,6 +18,8 @@ set(PICO_BOARD pico CACHE STRING "Board type")
 add_executable(${PROJECT_NAME}
         main.cpp
         receiver/Elrs.cpp
+        sensors/BMP5xx.cpp
+        ../../external/BMP581/bmp5.c
 
 )
 

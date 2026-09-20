@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <cstring>
 #include "pico/stdlib.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -10,6 +11,8 @@
 #include "debug/debug.hpp"
 #include "hardware/spi.h"
 #include "receiver/Elrs.hpp"
+#include "sensors/BMP5xx.h"
+
 
 extern "C" {
     uint32_t read_runtime_ctr(void) { return timer_hw->timerawl; }
@@ -23,27 +26,9 @@ extern "C" {
 TaskHandle_t elrs_task_handle = NULL;
 TaskHandle_t core0_task_handle = NULL;
 TaskHandle_t core1_task_handle = NULL;
+TaskHandle_t bmp581_task_handle = NULL;
 
 
-// CRSF standard CRC8 polynomial is 0xD5
-uint8_t crsf_crc8(uint8_t *data, uint8_t len) {
-    uint8_t crc = 0;
-    for (uint8_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x80) {
-                crc = (crc << 1) ^ 0xD5;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    return crc;
-}
-
-long map_val(long x, long in_min, long in_max, long out_min, long out_max) {
-  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
-}
 
 // ========================================================
 // CORE 1: Clock Speed Verification
@@ -91,7 +76,7 @@ void core0_system_task(void *pvParameters) {
 void core0_elrs_task(void *pvParameters) {
     (void)pvParameters;
     
-    printf("[Core 0] ELRS CRSF Task Initialized at 420k Baud\n");
+    DEBUG_PRINTF("[Core 0] ELRS CRSF Task Initialized at 420k Baud\n");
     Receiver::Elrs elrs(ELRS_UART);
 
     while(1)
@@ -101,6 +86,70 @@ void core0_elrs_task(void *pvParameters) {
         // Yield to let other system tasks run
         vTaskDelay(pdMS_TO_TICKS(4));
     }
+}
+
+
+
+
+
+
+void bmp581_task(void *pvParameters) {
+    (void)pvParameters;
+    BMP5xx bmp;
+    if (!bmp.begin(spi1, 10, 11, 12, 16, 1200000)) 
+    {
+        DEBUG_PRINTF("BMP5xx not found, status %d\n", bmp.lastStatus());
+        
+    }
+    
+    bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_2X);
+
+   
+    bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_16X);
+
+    
+    bmp.setIIRFilterCoeff(BMP5XX_IIR_FILTER_COEFF_127);
+
+    
+    bmp.setOutputDataRate(BMP5XX_ODR_80_HZ);
+
+   
+    bmp.setPowerMode(BMP5XX_POWERMODE_NORMAL);
+
+    
+    bmp.enablePressure(true);
+
+   
+    bmp.configureInterrupt(BMP5XX_INTERRUPT_PULSED,
+                            BMP5XX_INTERRUPT_ACTIVE_HIGH,
+                            BMP5XX_INTERRUPT_PUSH_PULL,
+                            BMP5XX_INTERRUPT_DATA_READY,
+                            true);
+    DEBUG_PRINTF("============================================================\n");
+    DEBUG_PRINTF("Current settings:\n");
+    DEBUG_PRINTF("  Temperature OSR: %d\n", bmp.getTemperatureOversampling());
+    DEBUG_PRINTF("  Pressure OSR: %d\n", bmp.getPressureOversampling());
+    DEBUG_PRINTF("  IIR Filter Coeff: %d\n", bmp.getIIRFilterCoeff());
+    DEBUG_PRINTF("  Output Data Rate: %d\n", bmp.getOutputDataRate());
+    DEBUG_PRINTF("============================================================\n");
+    
+
+    while (true) 
+    {   
+        if(bmp.dataReady())
+        {
+
+            if ( bmp.performReading())
+            {
+                float altitude = 44330.0f * (1.0f - powf(bmp.pressure / 1013.25, 0.1903f));
+                DEBUG_PRINTF("Tempreture: %0.2f Pressure: %0.2f Altitude: %0.2f\n", bmp.temperature, bmp.pressure, altitude);
+            }
+            
+        }
+             
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Read every second
+    }
+
 }
 
 int main() {
@@ -130,41 +179,21 @@ int main() {
     DEBUG_PRINTF("========================================\n");
 
     
-    /*
-    xTaskCreate(
-        core0_system_task, 
-        "TempTask", 
-        256, 
-        NULL, 
-        1, 
-        &core0_task_handle 
-    );
-    */
     
+    //xTaskCreate(core0_system_task, "TempTask", 256, NULL, 1, &core0_task_handle);
 
-    xTaskCreate(
-        core1_flight_task, 
-        "ClockTask", 
-        256, 
-        NULL, 
-        1, 
-        &core1_task_handle
-    );
+    xTaskCreate(bmp581_task,"BMPTask",256,NULL,1,&bmp581_task_handle);
 
-    xTaskCreate(
-        core0_elrs_task, 
-        "ELRSTask", 
-        512,        
-        NULL, 
-        2,          
-        &elrs_task_handle
-    );
+    xTaskCreate(core1_flight_task, "ClockTask", 256, NULL, 1, &core1_task_handle);
+
+    //xTaskCreate(core0_elrs_task, "ELRSTask", 256, NULL, 1, &elrs_task_handle);
 
 
-    vTaskCoreAffinitySet(elrs_task_handle, (1 << 0));
+    //vTaskCoreAffinitySet(elrs_task_handle, (1 << 0));
+    vTaskCoreAffinitySet(bmp581_task_handle, (1 << 1));
     //vTaskCoreAffinitySet(core0_task_handle, (1 << 0));
     vTaskCoreAffinitySet(core1_task_handle, (1 << 1));
-
+    
     vTaskStartScheduler();
 
     while (true) {
@@ -172,3 +201,6 @@ int main() {
     }
     return 0;
 }
+
+
+ 

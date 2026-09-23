@@ -147,7 +147,7 @@ void bmp581_task(void *pvParameters) {
             
         }
              
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Read every second
+        vTaskDelay(pdMS_TO_TICKS(10)); // Read every second
     }
 
 }

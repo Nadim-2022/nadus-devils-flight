@@ -20,6 +20,11 @@ add_executable(${PROJECT_NAME}
         receiver/Elrs.cpp
         sensors/BMP5xx.cpp
         ../../external/BMP581/bmp5.c
+        sensors/BNO08x.cpp
+        ../../external/sh2/sh2.c
+        ../../external/sh2/shtp.c
+        ../../external/sh2/sh2_util.c
+        ../../external/sh2/sh2_SensorValue.c
 
 )
 

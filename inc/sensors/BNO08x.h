@@ -17,11 +17,14 @@
 class BNO08x
 {
 public:
-    BNO08x();
-    
+    BNO08x(spi_inst_t* spi, uint8_t sck_pin, uint8_t mosi_pin, uint8_t miso_pin,
+                   uint8_t cs_pin, uint32_t baudrate, uint8_t int_pin, bool spi_init );
+    ~BNO08x() = default;
+
 
 private:
     float x = 0;
+    spi_inst_t* spi_x;
 
 };
 

@@ -22,8 +22,8 @@ public:
     void logData();
     void emergencyShutdown();
 private:
-    BNO08x bno;
-    BMP5xx bmp;
+    BNO08x &bno;
+    BMP5xx &bmp;
 
 
 };

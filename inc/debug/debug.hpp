@@ -10,4 +10,11 @@
     #define DEBUG_PRINTF_LOC(fmt, ...)    do {} while(0)
 #endif
 
+#ifdef BNO08X_DEBUG
+#define BNO08X_LOG(...) printf("[BNO08x] " __VA_ARGS__)
+#else
+#define BNO08X_LOG(...) ((void)0)
+#endif
+ 
+
 #endif // DEBUG_H

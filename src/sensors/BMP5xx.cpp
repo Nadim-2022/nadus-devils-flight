@@ -86,12 +86,12 @@ bool BMP5xx::begin(spi_inst_t* spi, uint sck_pin, uint mosi_pin, uint miso_pin,
     return false;
   }
  
-  spi_init(spi, baudrate);
-  spi_set_format(spi, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+  /* spi_init(spi, baudrate);
+  spi_set_format(spi, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
  
   gpio_set_function(sck_pin, GPIO_FUNC_SPI);
   gpio_set_function(mosi_pin, GPIO_FUNC_SPI);
-  gpio_set_function(miso_pin, GPIO_FUNC_SPI);
+  gpio_set_function(miso_pin, GPIO_FUNC_SPI); */
  
   return beginPreconfigured(spi, cs_pin);
 }
@@ -563,7 +563,7 @@ BMP5_INTF_RET_TYPE BMP5xx::spi_write(uint8_t reg_addr, const uint8_t* reg_data,
     return -1;
   }
  
-  sleep_us(200);
+  //sleep_us(200);
  
   return BMP5_INTF_RET_SUCCESS;
 }

@@ -38,6 +38,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 # Turns ON the DEBUG macro for all files in 'your_project_name'
 target_compile_definitions(${PROJECT_NAME} PRIVATE DEBUG)
+target_compile_definitions(${PROJECT_NAME} PRIVATE BNO08X_DEBUG)
 
 
 # Compiler options

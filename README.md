@@ -18,7 +18,7 @@ Nadus Devil's Flight (NDF) is an open-source, high-performance drone flight cont
 | GPIO 15     | RST        | Reset       |
 
 ### Barometer (BMP581) — SPI
-|| Pico 2 GPIO | BMP581 Pin | Function    |
+| Pico 2 GPIO | BMP581 Pin | Function    |
 |-------------|------------|-------------|
 | 3V3         | VIN        | Power       |
 | GND         | GND        | Ground      |

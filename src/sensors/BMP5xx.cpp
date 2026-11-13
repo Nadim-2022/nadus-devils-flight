@@ -45,12 +45,12 @@ static inline void cs_deselect(uint cs_pin) {
 /*!
  * @brief  BMP5xx constructor
  */
-BMP5xx::BMP5xx(void) {
+BMP5xx::BMP5xx(spi_inst_t* spi, uint cs_pin) {
   memset(&_bmp5_dev, 0, sizeof(_bmp5_dev));
   memset(&_osr_odr_config, 0, sizeof(_osr_odr_config));
   memset(&_iir_config, 0, sizeof(_iir_config));
-  _intf.spi = NULL;
-  _intf.cs_pin = 0;
+  _intf.spi = spi;
+  _intf.cs_pin = cs_pin;
   _last_status = BMP5_OK;
   temperature = 0.0f;
   pressure = 0.0f;
@@ -80,9 +80,8 @@ BMP5xx::~BMP5xx(void) {
  * @param baudrate SPI clock in Hz, default 1 MHz
  * @return True if initialization was successful, otherwise false.
  */
-bool BMP5xx::begin(spi_inst_t* spi, uint sck_pin, uint mosi_pin, uint miso_pin,
-                   uint cs_pin, uint32_t baudrate) {
-  if (!spi) {
+bool BMP5xx::initialize() {
+  if (!_intf.spi) {
     return false;
   }
  
@@ -93,7 +92,7 @@ bool BMP5xx::begin(spi_inst_t* spi, uint sck_pin, uint mosi_pin, uint miso_pin,
   gpio_set_function(mosi_pin, GPIO_FUNC_SPI);
   gpio_set_function(miso_pin, GPIO_FUNC_SPI); */
  
-  return beginPreconfigured(spi, cs_pin);
+  return beginPreconfigured(_intf.spi, _intf.cs_pin);
 }
  
 /*!
@@ -109,8 +108,8 @@ bool BMP5xx::beginPreconfigured(spi_inst_t* spi, uint cs_pin) {
     return false;
   }
  
-  _intf.spi = spi;
-  _intf.cs_pin = cs_pin;
+  //_intf.spi = spi;
+  //_intf.cs_pin = cs_pin;
  
   // Chip select idles high
   gpio_init(cs_pin);
@@ -257,7 +256,7 @@ bool BMP5xx::performReading(void) {
   }
  
   temperature = (float)sensor_data.temperature;
-  pressure = (float)sensor_data.pressure / 100.0f; // Convert Pa to hPa
+  pressure = (float)sensor_data.pressure ;// / 100.0f; // Convert Pa to hPa
  
   return true;
 }

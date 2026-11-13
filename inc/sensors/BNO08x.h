@@ -41,15 +41,14 @@ public:
    *                  be made to accept a command while it is idle by
    *                  resetting it (which needs reset_pin).
    */
-  BNO08x(spi_inst_t *spi, uint sck_pin, uint mosi_pin, uint miso_pin,
-         uint cs_pin, uint int_pin, int reset_pin = -1, int wake_pin = -1);
+  BNO08x(spi_inst_t *spi, uint cs_pin, uint int_pin, int reset_pin = -1, int wake_pin = -1);
  
   /*!
    * @brief Set up SPI/GPIO, reset the sensor and open the SH-2 interface.
    * @param baudrate SPI clock in Hz (BNO08x supports up to 3 MHz)
    * @return true on success
    */
-  bool begin(uint32_t baudrate = 3000000);
+  bool initialize();
  
   void hardwareReset(void);
   bool wasReset(void);
@@ -94,7 +93,7 @@ private:
   inline void csDeselect(void);
  
   spi_inst_t *_spi;
-  uint _sck, _mosi, _miso, _cs, _int;
+  uint _cs, _int;
   int _reset, _wake;
  
   sh2_SensorValue_t *_sensorValue = nullptr;

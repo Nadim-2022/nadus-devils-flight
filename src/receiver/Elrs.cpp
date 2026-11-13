@@ -92,92 +92,64 @@ namespace Receiver
     }
 
 
-    void Elrs::read_packet() 
+    bool Elrs::read_packet()
+{
+    bool got_channels = false;
+
+    while (uart_is_readable(uart))
     {
-     
-        while (uart_is_readable(uart)) 
+        uint8_t rx_byte = uart_getc(uart);
+
+        switch (get_state())
         {
-            uint8_t rx_byte = uart_getc(uart);
+            case ElrsState::WAIT_FOR_SYNC:
+                if (rx_byte == 0xC8) {
+                    state = ElrsState::READ_LENGTH;
+                }
+                break;
 
-            switch (get_state()) 
-            {
-                case ElrsState::WAIT_FOR_SYNC: // Looking for Sync Byte
-                    if (rx_byte == 0xC8) 
-                    {
-                        state = ElrsState::READ_LENGTH;
-                    }
-                    break;
-                    
-                case ElrsState::READ_LENGTH: // Reading Length
-                    payload_len_ = rx_byte;
-                    // FIX: Allow any valid CRSF payload length (max 62), 
-                    // otherwise we will throw away telemetry frames!
-                    if (payload_len_ > 1 && payload_len_ <= 62) 
-                    { 
-                        index = 0;
-                        state = ElrsState::READ_PAYLOAD;
-                    } else 
-                    {
-                        state = ElrsState::WAIT_FOR_SYNC; // Invalid length, reset
-                    }
-                    break;
-                    
-                case ElrsState::READ_PAYLOAD: // Reading Type, Payload, and CRC
+            case ElrsState::READ_LENGTH:
+                payload_len_ = rx_byte;
+                if (payload_len_ > 1 && payload_len_ <= 62) {
+                    index = 0;
+                    state = ElrsState::READ_PAYLOAD;
+                } else {
+                    state = ElrsState::WAIT_FOR_SYNC;
+                }
+                break;
 
-                    rx_buffer_[index++] = rx_byte;
-                    if (index == payload_len_) 
-                    {
-                        uint8_t calculated_crc = crc8(rx_buffer_, payload_len_ - 1);
-                        
-                        // Separate CRC check from Type check
-                        if (calculated_crc == rx_buffer_[payload_len_ - 1]) 
-                        {
-                            // We got a mathematically valid packet! Update the timeout tracker.
-                            last_packet_time = xTaskGetTickCount();
+            case ElrsState::READ_PAYLOAD:
+                rx_buffer_[index++] = rx_byte;
+                if (index == payload_len_) {
+                    uint8_t calculated_crc = crc8(rx_buffer_, payload_len_ - 1);
+                    if (calculated_crc == rx_buffer_[payload_len_ - 1]) {
+                        last_packet_time = xTaskGetTickCount();
+                        process_packet(&rx_buffer_[0], payload_len_ - 1);
 
-                            // Process the packet based on its type
-                            process_packet(&rx_buffer_[0], payload_len_ - 1); // Skip the type byte
-
-
-                            DEBUG_PRINTF("CH1:%u CH2:%u CH3:%u CH4:%u CH5:%u CH6:%u CH7:%u CH8:%u CH9:%u CH10:%u\n", 
-                                rc_channels[0], rc_channels[1], rc_channels[2], rc_channels[3], 
-                                rc_channels[4], rc_channels[5], rc_channels[6], rc_channels[7],
-                                rc_channels[8], rc_channels[9]);
-
-                            
+                        // 0x16 = CRSF RC channels packet
+                        if (rx_buffer_[0] == 0x16) {
+                            got_channels = true;
                         }
-                        
-                        // Reset to catch the next packet
-                        state = ElrsState::WAIT_FOR_SYNC; 
                     }
-                                
-                    break;
-
-
-            }
-                        
+                    state = ElrsState::WAIT_FOR_SYNC;
+                }
+                break;
         }
-    
-
-
-        TickType_t current_time = xTaskGetTickCount();
-        if ((current_time - last_packet_time) > pdMS_TO_TICKS(500)) 
-        {
-            if (is_tx_connected)
-            {
-                DEBUG_PRINTF("⚠️ FAILSAFE: Receiver Disconnected (UART Timeout)\n");
-                is_tx_connected = false;  
-            }
-        }
-        else 
-        {
-            if (!is_tx_connected) 
-            {
-                DEBUG_PRINTF("✅ LINK RESTORED!\n");
-                is_tx_connected = true;
-            }
-        }                       
-    
     }
+
+    // Link timeout check (runs on every call now)
+    TickType_t current_time = xTaskGetTickCount();
+    if ((current_time - last_packet_time) > pdMS_TO_TICKS(500)) {
+        if (is_tx_connected) {
+            DEBUG_PRINTF("FAILSAFE: Receiver Disconnected (UART Timeout)\n");
+            is_tx_connected = false;
+        }
+    } else if (!is_tx_connected) {
+        DEBUG_PRINTF("LINK RESTORED!\n");
+        is_tx_connected = true;
+    }
+
+    return got_channels;   // true only when new stick values arrived
+}
 
 } // namespace Receiver

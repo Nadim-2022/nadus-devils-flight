@@ -176,12 +176,10 @@ typedef struct {
  */
 class BMP5xx {
  public:
-  BMP5xx();
+  BMP5xx(spi_inst_t* spi, uint cs_pin);
   ~BMP5xx(void);
  
-  bool begin(spi_inst_t* spi, uint sck_pin, uint mosi_pin, uint miso_pin,
-             uint cs_pin,
-             uint32_t baudrate = BMP5XX_DEFAULT_SPI_BAUDRATE);
+  bool initialize();
   bool beginPreconfigured(spi_inst_t* spi, uint cs_pin);
  
   float readTemperature(void);

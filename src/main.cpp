@@ -13,9 +13,11 @@
 #include "receiver/Elrs.hpp"
 #include "sensors/BMP5xx.h"
 #include "sensors/BNO08x.h"
+#include "motor/Motors.hpp"
 #include "math.h"
 #include <ctype.h>
-
+#include "filter/AltKalman.h"
+#include "queue.h"
 
 extern "C" {
     uint32_t read_runtime_ctr(void) { return timer_hw->timerawl; }
@@ -26,14 +28,58 @@ extern "C" {
 #define ELRS_TX_PIN 4
 #define ELRS_RX_PIN 5
 
+// BNO08x bno(spi1, 10, 11, 12, 13, 14, 15);
+//bmp.begin(spi1, 10, 11, 12, 16, 3000000)
+
+// Pin definitions for SPI1
+#define SPI1_SCK_PIN 10
+#define SPI1_MOSI_PIN 11
+#define SPI1_MISO_PIN 12
+#define SPI1_BUADRATE 3000000 // 3 MHz
+
+// Pin definitions for BNO08x
+#define BNO08x_CS_PIN 13
+#define BNO08x_INT_PIN 14
+#define BNO08x_RESET_PIN 15
+
+// Pin definitions for BMP5xx
+#define BMP5xx_CS_PIN 16
+
+//Motor pins
+#define MOTOR0_PIN 18
+#define MOTOR1_PIN 19
+#define MOTOR2_PIN 20
+#define MOTOR3_PIN 21
+
+
 TaskHandle_t elrs_task_handle = NULL;
 TaskHandle_t core0_task_handle = NULL;
 TaskHandle_t core1_task_handle = NULL;
 TaskHandle_t bmp581_task_handle = NULL;
 TaskHandle_t bno085_task_handle = NULL;
+TaskHandle_t motor_test_handle = NULL;
 
 
 static constexpr float RAD2DEG = 57.2957795f;
+
+
+
+struct RcInput {
+    uint16_t ch[16];     // channel values from ELRS
+    uint32_t time_ms;    // when they were received (for failsafe)
+};
+
+static QueueHandle_t rc_mailbox;
+
+// --- Channel setup (ELRS default AETR order) ---
+#define CH_THROTTLE   2      // CH3 = index 2
+#define CH_ARM        4     // CH5 = index 4 (AUX1 switch)
+#define CH_MIN        992    // stick fully down  (CRSF raw values)
+#define CH_MAX        2011   // stick fully up
+#define CH_MID        1500
+#define FAILSAFE_MS   250    // no new packet for this long -> stop motors
+
+
 
 enum SerialCmd {
     CMD_NONE = 0,
@@ -115,12 +161,19 @@ void core0_elrs_task(void *pvParameters) {
     DEBUG_PRINTF("[Core 0] ELRS CRSF Task Initialized at 420k Baud\n");
     Receiver::Elrs elrs(ELRS_UART);
 
-    while(1)
-    {
-        elrs.read_packet();
-        
-        // Yield to let other system tasks run
-        vTaskDelay(pdMS_TO_TICKS(4));
+    while (1) {
+        if (elrs.read_packet()) {          // only when a new packet arrived
+            RcInput rc;
+            for (int i = 0; i < 16; i++) rc.ch[i] = elrs.rc_channels[i];
+            /* printf("RC Channels: ");
+            for (int i = 0; i < 16; i++) {
+                printf("%d ", rc.ch[i]);
+            }
+            printf("\n"); */
+            rc.time_ms = to_ms_since_boot(get_absolute_time());
+            xQueueOverwrite(rc_mailbox, &rc);   // always keep only the newest
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
@@ -132,15 +185,15 @@ void bmp581_task(void *pvParameters) {
     (void)pvParameters;
 
     vTaskDelay(pdMS_TO_TICKS(5000)); // Wait for system stabilization
-    BMP5xx bmp;
+    BMP5xx bmp (spi1, BMP5xx_CS_PIN); // Initialize BMP5xx with SPI1 and CS pin 16
 
-    if (!bmp.begin(spi1, 10, 11, 12, 16, 3000000)) 
+    if (!bmp.initialize()) 
     {
         DEBUG_PRINTF("BMP5xx not found, status %d\n", bmp.lastStatus());
     }
     
-    bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_2X);
-    bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_16X);   
+    bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_128X);
+    bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_128X);   
     bmp.setIIRFilterCoeff(BMP5XX_IIR_FILTER_COEFF_127);   
     bmp.setOutputDataRate(BMP5XX_ODR_80_HZ);  
     bmp.setPowerMode(BMP5XX_POWERMODE_NORMAL);
@@ -190,13 +243,41 @@ static void bno_int_isr(uint gpio, uint32_t events) {
 }
 
 
+static float g_ground_pa = 101325.0f;   // set at startup by baro_set_ground()
+
+// Average the pressure for a moment while the drone sits on the ground
+void baro_set_ground(float avg_pressure_pa) { g_ground_pa = avg_pressure_pa; }
+
+// Height above the takeoff point, in metres
+float baro_altitude_m(float pressure_pa) {
+    return 44330.0f * (1.0f - powf(pressure_pa / g_ground_pa, 0.190295f));
+}
+
+
+float world_up_accel(float qr, float qi, float qj, float qk,
+                     float ax, float ay, float az) {
+    return 2.0f * (qi * qk - qr * qj) * ax +
+           2.0f * (qj * qk + qr * qi) * ay +
+           (1.0f - 2.0f * (qi * qi + qj * qj)) * az;
+}
+
+static AltKalman kf;
 
 void bno085_task(void *pvParameters){
 
-    BNO08x bno(spi1, 10, 11, 12, 13, 14,
-                  15);
 
-    if (!bno.begin()) 
+    // Initialize the SPI1 interface for the BNO08x & BMP5xx sensors
+    spi_init(spi1, SPI1_BUADRATE);
+    spi_set_format(spi1, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
+    gpio_set_function(SPI1_SCK_PIN, GPIO_FUNC_SPI);
+    gpio_set_function(SPI1_MOSI_PIN, GPIO_FUNC_SPI);
+    gpio_set_function(SPI1_MISO_PIN, GPIO_FUNC_SPI);
+
+    
+    //  BNO08x(spi_inst_t *spi, uint cs_pin, uint int_pin, int reset_pin = -1, int wake_pin = -1);
+    BNO08x bno(spi1, BNO08x_CS_PIN, BNO08x_INT_PIN, BNO08x_RESET_PIN);
+
+    if (!bno.initialize()) 
     {
         DEBUG_PRINTF("Failed to find BNO08x\n");
         while (true) 
@@ -234,31 +315,37 @@ void bno085_task(void *pvParameters){
  */
 
     bno.setDcdAutoSave(false); 
-    if (!bno.enableReport(SH2_ROTATION_VECTOR, 5000)) 
+    
+    
+    if (!bno.enableReport(SH2_LINEAR_ACCELERATION, 5000))
+    { 
+        DEBUG_PRINTF("Could not enable linear acceleration\n");
+    }
+    if (!bno.enableReport(SH2_ROTATION_VECTOR, 2500)) 
     { 
         DEBUG_PRINTF("Could not enable rotation vector\n");
     }
 
     //--------------------BMP581-------------------------//
 
-    BMP5xx bmp;
+    BMP5xx bmp(spi1, BMP5xx_CS_PIN); // Initialize BMP5xx with SPI1 and CS pin 16
 
-    if (!bmp.begin(spi1, 10, 11, 12, 16, 3000000)) 
+    if (!bmp.initialize()) 
     {
         DEBUG_PRINTF("BMP5xx not found, status %d\n", bmp.lastStatus());
     }
     
-    bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_2X);
-    bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_16X);   
-    bmp.setIIRFilterCoeff(BMP5XX_IIR_FILTER_COEFF_127);   
-    bmp.setOutputDataRate(BMP5XX_ODR_240_HZ);  
-    bmp.setPowerMode(BMP5XX_POWERMODE_NORMAL);
+    bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_1X);
+    bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_8X);   
+    bmp.setIIRFilterCoeff( BMP5XX_IIR_FILTER_BYPASS);   
+    bmp.setOutputDataRate(BMP5XX_ODR_10_HZ);  
+    bmp.setPowerMode(BMP5XX_POWERMODE_CONTINUOUS);
 
     
     bmp.enablePressure(true);
 
    
-    bmp.configureInterrupt(BMP5XX_INTERRUPT_PULSED,
+    bmp.configureInterrupt(BMP5XX_INTERRUPT_LATCHED,
                             BMP5XX_INTERRUPT_ACTIVE_HIGH,
                             BMP5XX_INTERRUPT_PUSH_PULL,
                             BMP5XX_INTERRUPT_DATA_READY,
@@ -272,25 +359,82 @@ void bno085_task(void *pvParameters){
     DEBUG_PRINTF("============================================================\n");
     
     // ========================================================//
-
     
+    
+    kf.setAccelNoise(0.1f);    // was 0.5
+    kf.setBiasWalk(0.001f);    // was 0.01
+    kf.setBaroNoise(0.3f);     // was 0.2
+    kf.setGateSigma(4.0f);    // 0 = no spike rejection
+    kf.reset(0.0f);
+
     sh2_SensorValue_t value;
+    
     static uint32_t count = 0, last_ms = 0, countPressure = 0;
     float qr = 1.0, qi = 0.0, qj = 0.0, qk = 0.0;
     float roll_deg = 0.0, pitch_deg = 0.0, yaw_deg = 0.0;
 
+    
+    float lin_ax = 0, lin_ay = 0, lin_az = 0;
+    float baro_h = 0.0f;
+    uint32_t last_baro_ms  = 0;
+    float a_up;
+    uint32_t last_alt_us = time_us_32();
+
     gpio_set_irq_enabled_with_callback(14, GPIO_IRQ_EDGE_FALL,true, &bno_int_isr);
+
+    float avg_dt = 0.0f, avg_alt=0.0f, avg_a_up=0.0f, avg_baro_h=0.0f, avg_alt_v=0.0f;
+    int count_avg = 0;
+    int count_linear_accel = 0;
+
+
+    //==========================================================================================
+        // Let the BMP581 settle after configuration (IIR filter restarts)
+    uint32_t t_settle = to_ms_since_boot(get_absolute_time());
+    while (to_ms_since_boot(get_absolute_time()) - t_settle < 1000) {
+        if (bmp.dataReady()) bmp.performReading();   // read and discard
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    // Average ~2 s of readings (200 samples at 100 Hz)
+    const int num_samples = 20;
+    double sum = 0.0;                     // double: no precision loss
+    float  p_min = 1e9f, p_max = 0.0f;
+    for (int i = 0; i < num_samples; ) {
+        if (bmp.dataReady() && bmp.performReading()) {
+            sum += bmp.pressure;
+            if (bmp.pressure < p_min) p_min = bmp.pressure;
+            if (bmp.pressure > p_max) p_max = bmp.pressure;
+            i++;
+            
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    float avg_pressure = (float)(sum / num_samples);
+    baro_set_ground(avg_pressure);
+    printf("Ground pressure: %.4f hPa  (spread %.2f Pa)\n",
+    avg_pressure, (p_max - p_min) * 100.0f);
+    //=================================================================================
+
+
+
+
 
     while (true) 
     {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
         if (bno.wasReset()) {
             DEBUG_PRINTF("Sensor was reset\n");
-            bno.enableReport(SH2_ROTATION_VECTOR, 5000);
+            bno.enableReport(SH2_ROTATION_VECTOR, 2500);
             sh2_SensorConfig_t cfg;
             if (sh2_getSensorConfig(SH2_ROTATION_VECTOR, &cfg) == SH2_OK)
             {
                 DEBUG_PRINTF("RV actual interval: %lu us (%.1f Hz)\n",
+                            (unsigned long)cfg.reportInterval_us,
+                            cfg.reportInterval_us ? 1e6f / cfg.reportInterval_us : 0.0f);
+            }
+            if (sh2_getSensorConfig(SH2_LINEAR_ACCELERATION, &cfg) == SH2_OK)
+            {
+                DEBUG_PRINTF("LA actual interval: %lu us (%.1f Hz)\n",
                             (unsigned long)cfg.reportInterval_us,
                             cfg.reportInterval_us ? 1e6f / cfg.reportInterval_us : 0.0f);
             }
@@ -306,6 +450,13 @@ void bno085_task(void *pvParameters){
                 qj = value.un.rotationVector.j;
                 qk = value.un.rotationVector.k;
                 new_att = true;
+            }
+            else if (value.sensorId == SH2_LINEAR_ACCELERATION) {
+                lin_ax = value.un.linearAcceleration.x;
+                lin_ay = value.un.linearAcceleration.y;
+                lin_az = value.un.linearAcceleration.z;
+                count_linear_accel++;
+                //new_att = true;
             }
         }
 
@@ -336,26 +487,137 @@ void bno085_task(void *pvParameters){
 
                 if ( bmp.performReading())
                 {
-                    float altitude = 44330.0f * (1.0f - powf(bmp.pressure / 1013.25, 0.1903f));
-                    //DEBUG_PRINTF("Tempreture: %0.2f Pressure: %0.2f Altitude: %0.2f\n", bmp.temperature, bmp.pressure, altitude);
-                    printf("Altitude: %0.2f, Pressure: %0.2f, Temperature: %0.2f\n", altitude, bmp.pressure, bmp.temperature);
+                    //float altitude = 44330.0f * (1.0f - powf(bmp.pressure / 1013.25, 0.1903f));
+                    baro_h = baro_altitude_m(bmp.pressure);
+                    kf.updateBaro(baro_h);
+                    uint32_t now_us = time_us_32();
+                    float dt = (now_us - last_alt_us) * 1e-6f;
+                    last_alt_us = now_us;
+
+                    a_up = world_up_accel(qr, qi, qj, qk, lin_ax, lin_ay, lin_az);
+                    
+                    // low-pass filter the vertical acceleration to reduce noise
+                    static float a_up_filt = 0.0f;
+                    const float alpha = 0.1f; 
+                    a_up_filt = alpha * a_up + (1.0f - alpha) * a_up_filt;
+                    a_up = a_up_filt;
+                    kf.predict(a_up, dt); 
+                    //printf("Altitude: %.2f\n", kf.altitude());
+                    //if (baro_h < 0.0f) baro_h = 0.0f;
+                    printf("%0.4f \n", kf.altitude());
+                
                     countPressure++;
                 }
                 
             }
+
+            /* uint32_t now_us = time_us_32();
+            float dt = (now_us - last_alt_us) * 1e-6f;
+            last_alt_us = now_us;
+
+            a_up = world_up_accel(qr, qi, qj, qk, lin_ax, lin_ay, lin_az);
+            
+            // low-pass filter the vertical acceleration to reduce noise
+            static float a_up_filt = 0.0f;
+            const float alpha = 0.1f; 
+            a_up_filt = alpha * a_up + (1.0f - alpha) * a_up_filt;
+            a_up = a_up_filt;
+            kf.predict(a_up, dt); 
+            printf("Altitude: %.2f\n", kf.altitude()); */
+           
         }
+
         uint32_t now = to_ms_since_boot(get_absolute_time());
         if (now - last_ms >= 1000) {
-            DEBUG_PRINTF("RV reports/s: %lu\n", (unsigned long)count);
-            DEBUG_PRINTF("Pressure readings/s: %lu\n", (unsigned long)countPressure);
-            //DEBUG_PRINTF("Roll: %.2f, Pitch: %.2f, Yaw: %.2f\n", roll_deg, pitch_deg, yaw_deg);
+            DEBUG_PRINTF("Roll: %.2f, Pitch: %.2f, Yaw: %.2f\n", roll_deg, pitch_deg, yaw_deg);
+            //Print all the counts
+            //DEBUG_PRINTF("Counts in last second: Attitude: %u, Linear Accel: %u, Pressure: %u\n", count, count_linear_accel, countPressure);
             count = 0;
+            count_linear_accel = 0;
             countPressure = 0;
             last_ms = now;
+
+
         }
         
     }
    
+}
+
+
+static float stick_to_throttle(uint16_t v) {
+    float t = (float)(v - CH_MIN) / (float)(CH_MAX - CH_MIN);
+    if (t < 0.02f) t = 0.0f;        // bottom 2 % of the stick = idle
+    if (t > 1.0f)  t = 1.0f;
+    return t;
+}
+
+void motor_task(void *pvParameters) {
+    (void)pvParameters;
+
+    Motors::Config cfg;
+    cfg.pins[0] = 18;  cfg.pins[1] = 19;  cfg.pins[2] = 20;  cfg.pins[3] = 21;
+    cfg.count   = 4;
+    static Motors motors(cfg);
+
+    if (!motors.begin()) {
+        DEBUG_PRINTF("Motors error: %s\n", motors.lastError());
+        vTaskDelete(NULL);
+    }
+    printf("Motors initialized\n");
+    vTaskDelay(pdMS_TO_TICKS(4000));          // ESC initialisation
+    
+
+   /*  motors.arm();
+    motors.setAll(1.0f);                                  // 2000 us = MAX
+    DEBUG_PRINTF("ESC CAL: MAX (2000 us). CONNECT BATTERY NOW.\n");
+    vTaskDelay(pdMS_TO_TICKS(10000));                     // 10 s to plug in + beeps
+
+    motors.disarm();                                      // 1000 us = MIN
+    DEBUG_PRINTF("ESC CAL: MIN (1000 us). Wait for confirmation beeps.\n");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    DEBUG_PRINTF("ESC CAL: DONE. Disconnect battery.\n");
+    while (true) vTaskDelay(pdMS_TO_TICKS(1000)); */
+
+    RcInput rc = {};
+    bool have_rc = false;
+    uint32_t last_print = 0;
+
+    while (true) {
+        if (xQueuePeek(rc_mailbox, &rc, 0) == pdTRUE) have_rc = true;
+
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        bool link_ok   = have_rc && (now - rc.time_ms) < FAILSAFE_MS;
+        bool arm_sw    = link_ok && rc.ch[CH_ARM] > CH_MID;
+
+        //printf("link_ok=%d, arm_sw=%d, throttle=%.2f rc.ch[CH_ARM]=%d\n", link_ok, arm_sw, stick_to_throttle(rc.ch[CH_THROTTLE]), rc.ch[CH_ARM]);
+        float throttle = link_ok ? stick_to_throttle(rc.ch[CH_THROTTLE]) : 0.0f;
+
+        if (!motors.isArmed()) {
+            // Arm only with the switch ON and the throttle stick DOWN
+            if (arm_sw && throttle < 0.05f) {
+                motors.arm();
+                DEBUG_PRINTF("ARMED\n");
+            }
+        } else if (!arm_sw) {
+            // Switch OFF, or signal lost (failsafe)
+            motors.disarm();
+            //DEBUG_PRINTF(link_ok ? "DISARMED\n" : "FAILSAFE: signal lost, DISARMED\n");
+            printf("Disarmed: link_ok=%d, arm_sw=%d, throttle=%.2f\n", link_ok, arm_sw, throttle);
+        }
+
+        motors.setAll(throttle);              // ignored (stop pulse) while disarmed
+
+        if (now - last_print >= 1000) {
+            last_print = now;
+            DEBUG_PRINTF("link:%d armed:%d throttle:%.2f pulse:%u us\n",
+                         link_ok, motors.isArmed(), (double)throttle, motors.pulseUs(0));
+            DEBUG_PRINTF("pulses: %u %u %u %u us\n",
+             motors.pulseUs(0), motors.pulseUs(1), motors.pulseUs(2), motors.pulseUs(3));
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));         // 200 Hz
+    }
 }
 
 
@@ -385,22 +647,23 @@ int main() {
     DEBUG_PRINTF("Nadus Devil's Flight - Hardware Verification\n");
     DEBUG_PRINTF("========================================\n");
 
-    
+    rc_mailbox = xQueueCreate(1, sizeof(RcInput));
     
     xTaskCreate(core0_system_task, "TempTask", 256, NULL, 1, &core0_task_handle);
 
     //xTaskCreate(core1_flight_task, "ClockTask", 256, NULL, 1, &core1_task_handle);
 
-    //xTaskCreate(core0_elrs_task, "ELRSTask", 256, NULL, 1, &elrs_task_handle);
-    xTaskCreate(bno085_task, "ImuTask", 1024, NULL, 1, &bno085_task_handle);
+    xTaskCreate(core0_elrs_task, "ELRSTask", 256, NULL, 1, &elrs_task_handle);
+    //xTaskCreate(bno085_task, "ImuTask", 1024, NULL, 1, &bno085_task_handle);
     //xTaskCreate(bmp581_task,"BMPTask",1024,NULL,1,&bmp581_task_handle);
+    xTaskCreate(motor_task, "MotorTest", 1024, NULL, 1, &motor_test_handle);
 
-
-    //vTaskCoreAffinitySet(elrs_task_handle, (1 << 0));
-    vTaskCoreAffinitySet(core0_task_handle, (1 << 0));
+    vTaskCoreAffinitySet(elrs_task_handle, (1 << 0));
+    //vTaskCoreAffinitySet(core0_task_handle, (1 << 0));
     //vTaskCoreAffinitySet(core1_task_handle, (1 << 1));
-    vTaskCoreAffinitySet(bno085_task_handle, (1 << 1));
+    //vTaskCoreAffinitySet(bno085_task_handle, (1 << 1));
     //vTaskCoreAffinitySet(bmp581_task_handle, (1 << 1));
+    vTaskCoreAffinitySet(motor_test_handle, (1 << 1));
 
     
     vTaskStartScheduler();

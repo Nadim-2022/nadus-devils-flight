@@ -14,10 +14,10 @@
 #include "hardware/gpio.h"
 #include "debug/debug.hpp"
 
-BNO08x::BNO08x(spi_inst_t *spi, uint sck_pin, uint mosi_pin, uint miso_pin,
-               uint cs_pin, uint int_pin, int reset_pin, int wake_pin)
-    : _spi(spi), _sck(sck_pin), _mosi(mosi_pin), _miso(miso_pin),
-      _cs(cs_pin), _int(int_pin), _reset(reset_pin), _wake(wake_pin) {
+
+
+BNO08x::BNO08x(spi_inst_t *spi, uint cs_pin, uint int_pin, int reset_pin, int wake_pin)
+    : _spi(spi), _cs(cs_pin), _int(int_pin), _reset(reset_pin), _wake(wake_pin) {
   memset(&prodIds, 0, sizeof(prodIds));
   memset(&_hal, 0, sizeof(_hal));
 }
@@ -25,13 +25,13 @@ BNO08x::BNO08x(spi_inst_t *spi, uint sck_pin, uint mosi_pin, uint miso_pin,
 /*!
  * @brief Set up SPI and GPIO, reset the sensor and open SH-2.
  */
-bool BNO08x::begin(uint32_t baudrate) {
+bool BNO08x::initialize() {
   // SPI mode 3 (CPOL=1, CPHA=1), MSB first
-  spi_init(_spi, baudrate);
+  /* spi_init(_spi, baudrate);
   spi_set_format(_spi, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
   gpio_set_function(_sck, GPIO_FUNC_SPI);
   gpio_set_function(_mosi, GPIO_FUNC_SPI);
-  gpio_set_function(_miso, GPIO_FUNC_SPI);
+  gpio_set_function(_miso, GPIO_FUNC_SPI); */
  
   // Chip select is driven manually so it stays low for a whole transfer
   gpio_init(_cs);

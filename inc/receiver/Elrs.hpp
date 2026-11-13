@@ -32,10 +32,11 @@ namespace Receiver
         public:
             explicit Elrs(uart_inst_t *uart_instance);
             ~Elrs() = default;
-            void read_packet();  
+            bool read_packet();  
             bool is_connected();
             bool set_keep_running(bool value);
-            
+            uint16_t rc_channels[16] = {0};
+
             
                 
         private:
@@ -48,8 +49,7 @@ namespace Receiver
             ElrsState state= ElrsState::WAIT_FOR_SYNC;
             uint8_t payload_len_ = 0;
             uint8_t index= 0;
-            uint16_t rc_channels[16] = {0};
-
+            
             TickType_t last_packet_time = 0;
             uint8_t link_quality = 0;
             uint8_t rssi_dbm = 0;

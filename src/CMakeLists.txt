@@ -25,6 +25,8 @@ add_executable(${PROJECT_NAME}
         ../../external/sh2/shtp.c
         ../../external/sh2/sh2_util.c
         ../../external/sh2/sh2_SensorValue.c
+        filter/AltKalman.cpp
+        motor/Motors.cpp
 
 )
 
@@ -38,7 +40,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 # Turns ON the DEBUG macro for all files in 'your_project_name'
 target_compile_definitions(${PROJECT_NAME} PRIVATE DEBUG)
-target_compile_definitions(${PROJECT_NAME} PRIVATE BNO08X_DEBUG)
+#target_compile_definitions(${PROJECT_NAME} PRIVATE BNO08X_DEBUG)
 
 
 # Compiler options
@@ -60,6 +62,7 @@ target_link_libraries(${PROJECT_NAME}
         hardware_adc
         hardware_uart
         hardware_spi
+        hardware_pwm
 )
 
 pico_add_extra_outputs(${PROJECT_NAME})

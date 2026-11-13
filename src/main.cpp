@@ -545,6 +545,195 @@ void bno085_task(void *pvParameters){
 }
 
 
+// ========================================================
+// BNO085 only: attitude (roll / pitch / yaw), no BMP581
+// Uses bno085_task_handle so the existing bno_int_isr wakes it.
+// ========================================================
+void bno085_imu_task(void *pvParameters){
+
+
+    // Initialize the SPI1 interface for the BNO08x & BMP5xx sensors
+    spi_init(spi1, SPI1_BUADRATE);
+    spi_set_format(spi1, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
+    gpio_set_function(SPI1_SCK_PIN, GPIO_FUNC_SPI);
+    gpio_set_function(SPI1_MOSI_PIN, GPIO_FUNC_SPI);
+    gpio_set_function(SPI1_MISO_PIN, GPIO_FUNC_SPI);
+
+    
+    //  BNO08x(spi_inst_t *spi, uint cs_pin, uint int_pin, int reset_pin = -1, int wake_pin = -1);
+    BNO08x bno(spi1, BNO08x_CS_PIN, BNO08x_INT_PIN, BNO08x_RESET_PIN);
+
+    if (!bno.initialize()) 
+    {
+        DEBUG_PRINTF("Failed to find BNO08x\n");
+        while (true) 
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    DEBUG_PRINTF("BNO08x found\n");
+    for (int n = 0; n < bno.prodIds.numEntries; n++) 
+    {
+        DEBUG_PRINTF("Part %lu: v%u.%u.%u build %lu\n",
+            (unsigned long)bno.prodIds.entry[n].swPartNumber,
+            bno.prodIds.entry[n].swVersionMajor,
+            bno.prodIds.entry[n].swVersionMinor,
+            bno.prodIds.entry[n].swVersionPatch,
+            (unsigned long)bno.prodIds.entry[n].swBuildNumber);
+    }
+
+   /*  while(serial_poll_command() != CMD_CALIBRATE) 
+    {
+        DEBUG_PRINTF("Type 'cal' to start calibration\n");
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (bno.calibrate()) 
+    {          // up to 2 minutes
+        DEBUG_PRINTF("Calibration saved\n");
+    } 
+    else 
+    {
+        DEBUG_PRINTF("Calibration failed\n");
+    }
+
+ */
+
+    bno.setDcdAutoSave(false); 
+    
+    
+    if (!bno.enableReport(SH2_LINEAR_ACCELERATION, 5000))
+    { 
+        DEBUG_PRINTF("Could not enable linear acceleration\n");
+    }
+    // Game Rotation Vector = gyro + accel only, no magnetometer.
+    // Motor current can't pull roll/pitch/yaw around. Yaw is relative to power-up.
+    if (!bno.enableReport(SH2_GAME_ROTATION_VECTOR, 2500)) 
+    { 
+        DEBUG_PRINTF("Could not enable game rotation vector\n");
+    }
+    // Rotation Vector (uses the magnetometer) only for the compass heading, 50 Hz
+    if (!bno.enableReport(SH2_ROTATION_VECTOR, 20000)) 
+    { 
+        DEBUG_PRINTF("Could not enable rotation vector\n");
+    }
+
+    sh2_SensorValue_t value;
+    
+    static uint32_t count = 0, last_ms = 0;
+    float qr = 1.0, qi = 0.0, qj = 0.0, qk = 0.0;
+    float roll_deg = 0.0, pitch_deg = 0.0, yaw_deg = 0.0;
+    float compass_deg = 0.0f, compass_acc_deg = 0.0f;   // magnetometer heading, 0 = north, clockwise
+
+    
+    float lin_ax = 0, lin_ay = 0, lin_az = 0;
+
+    gpio_set_irq_enabled_with_callback(14, GPIO_IRQ_EDGE_FALL,true, &bno_int_isr);
+
+    int count_linear_accel = 0;
+
+
+    while (true) 
+    {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        if (bno.wasReset()) {
+            DEBUG_PRINTF("Sensor was reset\n");
+            bno.enableReport(SH2_GAME_ROTATION_VECTOR, 2500);
+            bno.enableReport(SH2_ROTATION_VECTOR, 20000);
+            sh2_SensorConfig_t cfg;
+            if (sh2_getSensorConfig(SH2_GAME_ROTATION_VECTOR, &cfg) == SH2_OK)
+            {
+                DEBUG_PRINTF("GRV actual interval: %lu us (%.1f Hz)\n",
+                            (unsigned long)cfg.reportInterval_us,
+                            cfg.reportInterval_us ? 1e6f / cfg.reportInterval_us : 0.0f);
+            }
+            if (sh2_getSensorConfig(SH2_ROTATION_VECTOR, &cfg) == SH2_OK)
+            {
+                DEBUG_PRINTF("RV actual interval: %lu us (%.1f Hz)\n",
+                            (unsigned long)cfg.reportInterval_us,
+                            cfg.reportInterval_us ? 1e6f / cfg.reportInterval_us : 0.0f);
+            }
+            if (sh2_getSensorConfig(SH2_LINEAR_ACCELERATION, &cfg) == SH2_OK)
+            {
+                DEBUG_PRINTF("LA actual interval: %lu us (%.1f Hz)\n",
+                            (unsigned long)cfg.reportInterval_us,
+                            cfg.reportInterval_us ? 1e6f / cfg.reportInterval_us : 0.0f);
+            }
+
+        }
+
+        bool new_att = false;
+        while (bno.getSensorEvent(&value)) {
+            if (value.sensorId == SH2_GAME_ROTATION_VECTOR) {
+                count++;
+                qr = value.un.gameRotationVector.real;
+                qi = value.un.gameRotationVector.i;
+                qj = value.un.gameRotationVector.j;
+                qk = value.un.gameRotationVector.k;
+                new_att = true;
+            }
+            else if (value.sensorId == SH2_ROTATION_VECTOR) {
+                // Magnetometer-referenced yaw -> compass heading (not used for control)
+                float mr = value.un.rotationVector.real;
+                float mi = value.un.rotationVector.i;
+                float mj = value.un.rotationVector.j;
+                float mk = value.un.rotationVector.k;
+                float mag_yaw = atan2f(2.0f * (mr * mk + mi * mj),
+                                       1.0f - 2.0f * (mj * mj + mk * mk)) * RAD2DEG;
+                compass_deg = 90.0f - mag_yaw;
+                if (compass_deg < 0.0f)    compass_deg += 360.0f;
+                if (compass_deg >= 360.0f) compass_deg -= 360.0f;
+                compass_acc_deg = value.un.rotationVector.accuracy * RAD2DEG;
+            }
+            else if (value.sensorId == SH2_LINEAR_ACCELERATION) {
+                lin_ax = value.un.linearAcceleration.x;
+                lin_ay = value.un.linearAcceleration.y;
+                lin_az = value.un.linearAcceleration.z;
+                count_linear_accel++;
+                //new_att = true;
+            }
+        }
+
+        
+        if (new_att) {
+            uint32_t t0 = time_us_32();
+            float sinp = 2.0f * (qr * qj - qk * qi);
+            if (sinp >  1.0f) sinp =  1.0f;   // guard against NaN
+            if (sinp < -1.0f) sinp = -1.0f;
+
+            roll_deg  = atan2f(2.0f * (qr * qi + qj * qk),
+                            1.0f - 2.0f * (qi * qi + qj * qj)) * RAD2DEG;
+            pitch_deg = asinf(sinp) * RAD2DEG;
+            yaw_deg   = atan2f(2.0f * (qr * qk + qi * qj),
+                            1.0f - 2.0f * (qj * qj + qk * qk)) * RAD2DEG;
+
+            // run PID here, once per new attitude
+           // uint32_t work_us = time_us_32() - t0; 
+           // printf("Works time : %lu\n", work_us);
+           //DEBUG_PRINTF("Roll: %.2f, Pitch: %.2f, Yaw: %.2f\n", roll_deg, pitch_deg, yaw_deg);
+            //printf("Orientation: %.2f, %.2f, %.2f, %.2f\n", yaw_deg, pitch_deg, roll_deg, compass_deg);
+           
+        }
+
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (now - last_ms >= 1000) {
+            DEBUG_PRINTF("Roll: %.2f, Pitch: %.2f, Yaw: %.2f, Compass: %.1f deg (+/- %.1f), Az: %.3f m/s^2\n",
+                         roll_deg, pitch_deg, yaw_deg, compass_deg, compass_acc_deg, lin_az);
+            //Print all the counts
+            //DEBUG_PRINTF("Counts in last second: Attitude: %u, Linear Accel: %u\n", count, count_linear_accel);
+            count = 0;
+            count_linear_accel = 0;
+            last_ms = now;
+
+
+        }
+        
+    }
+   
+}
+
+
 static float stick_to_throttle(uint16_t v) {
     float t = (float)(v - CH_MIN) / (float)(CH_MAX - CH_MIN);
     if (t < 0.02f) t = 0.0f;        // bottom 2 % of the stick = idle
@@ -611,10 +800,10 @@ void motor_task(void *pvParameters) {
 
         if (now - last_print >= 1000) {
             last_print = now;
-            DEBUG_PRINTF("link:%d armed:%d throttle:%.2f pulse:%u us\n",
-                         link_ok, motors.isArmed(), (double)throttle, motors.pulseUs(0));
-            DEBUG_PRINTF("pulses: %u %u %u %u us\n",
-             motors.pulseUs(0), motors.pulseUs(1), motors.pulseUs(2), motors.pulseUs(3));
+           /*  DEBUG_PRINTF("link:%d armed:%d throttle:%.2f pulse:%u us\n",
+                         link_ok, motors.isArmed(), (double)throttle, motors.pulseUs(0)); */
+            /* DEBUG_PRINTF("pulses: %u %u %u %u us\n",
+             motors.pulseUs(0), motors.pulseUs(1), motors.pulseUs(2), motors.pulseUs(3)); */
         }
         vTaskDelay(pdMS_TO_TICKS(5));         // 200 Hz
     }
@@ -655,13 +844,14 @@ int main() {
 
     xTaskCreate(core0_elrs_task, "ELRSTask", 256, NULL, 1, &elrs_task_handle);
     //xTaskCreate(bno085_task, "ImuTask", 1024, NULL, 1, &bno085_task_handle);
+    xTaskCreate(bno085_imu_task, "BnoTask", 1024, NULL, 1, &bno085_task_handle);
     //xTaskCreate(bmp581_task,"BMPTask",1024,NULL,1,&bmp581_task_handle);
     xTaskCreate(motor_task, "MotorTest", 1024, NULL, 1, &motor_test_handle);
 
     vTaskCoreAffinitySet(elrs_task_handle, (1 << 0));
     //vTaskCoreAffinitySet(core0_task_handle, (1 << 0));
     //vTaskCoreAffinitySet(core1_task_handle, (1 << 1));
-    //vTaskCoreAffinitySet(bno085_task_handle, (1 << 1));
+    vTaskCoreAffinitySet(bno085_task_handle, (1 << 1));
     //vTaskCoreAffinitySet(bmp581_task_handle, (1 << 1));
     vTaskCoreAffinitySet(motor_test_handle, (1 << 1));
 

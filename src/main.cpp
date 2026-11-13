@@ -815,7 +815,13 @@ void motor_task(void *pvParameters) {
 // FLIGHT CONTROL
 // roll / pitch : self level, stick = tilt angle
 // yaw : stick = turn speed
-// throttle : straight from the stick, no altitude hold, no BMP581
+// height : BMP581 + BNO085 up acceleration (AltKalman), throttle stick = climb speed
+//
+// Throttle stick springs back to the middle
+// middle = hold height, up = climb, down = come down
+// After arming it takes off by itself and holds TAKEOFF_HEIGHT_M
+// Hold the stick down to land, it disarms by itself on the ground
+// RC lost in the air = lands by itself
 //
 // Same BNO085 setup as bno085_imu_task + calibrated gyro at 400 Hz.
 // Replaces bno085_imu_task and motor_task, don't run them together.
@@ -835,7 +841,9 @@ void motor_task(void *pvParameters) {
 static constexpr float ROLL_STICK_DIRECTION = +1.0f; // stick right = roll right
 static constexpr float PITCH_STICK_DIRECTION = +1.0f; // stick forward = nose down
 static constexpr float YAW_STICK_DIRECTION = +1.0f; // stick right = yaw right
+static constexpr float THROTTLE_STICK_DIRECTION = +1.0f; // stick up = climb
 static constexpr float STICK_DEADBAND = 0.03f;
+static constexpr float THROTTLE_STICK_DEADBAND = 0.10f; // spring centre is never exact
 
 // BNO085 mounted flat, X arrow to the front, Y to the left, Z up
 static constexpr float IMU_ROLL_DIRECTION = +1.0f;
@@ -872,12 +880,49 @@ static constexpr float MAX_TILT_ANGLE_DEG = 25.0f; // full stick
 static constexpr float MAX_TILT_SPEED_DEG_S = 150.0f; // max output of the angle loop
 static constexpr float MAX_YAW_SPEED_DEG_S = 120.0f; // full yaw stick
 static constexpr float PID_START_THROTTLE = 0.05f; // below this motors idle and PID off
-static constexpr float INTEGRAL_START_THROTTLE = 0.15f; // below this I stays frozen (on the ground)
+
+// Height
+static constexpr float TAKEOFF_HEIGHT_M = 1.0f; // goes here after arming
+static constexpr float MAX_HEIGHT_M = 3.0f; // stick can't take it higher
+static constexpr float MAX_CLIMB_SPEED_M_S = 1.0f; // full stick up or down
+static constexpr float TAKEOFF_CLIMB_SPEED_M_S = 0.5f; // up to TAKEOFF_HEIGHT_M
+static constexpr float LANDING_SPEED_M_S = 0.3f;
+static constexpr float SLOW_DOWN_HEIGHT_M = 0.7f; // below this never faster down than landing speed
+static constexpr float HEIGHT_GAIN = 1.0f; // m/s of climb speed per m off the target height
+
+// Take off
+static constexpr uint32_t SPIN_UP_MS = 1500; // props at idle after arming
+static constexpr float TAKEOFF_START_THROTTLE = 0.15f;
+static constexpr float TAKEOFF_THROTTLE_RAMP = 0.10f; // throttle added per second until it lifts
+static constexpr float TAKEOFF_MAX_THROTTLE = 0.70f;
+static constexpr uint32_t NO_LIFTOFF_MS = 2000; // at max take off throttle this long = give up
+static constexpr float LIFTOFF_HEIGHT_M = 0.25f;
+static constexpr float LIFTOFF_CLIMB_SPEED_M_S = 0.10f;
+
+// Thrust limits for the height control
+static constexpr float MAX_THRUST_CHANGE = 0.20f; // up or down from the take off hover throttle
+static constexpr float MIN_FLYING_THROTTLE = 0.10f;
+static constexpr float MAX_FLYING_THROTTLE = 0.80f;
+static constexpr float MIN_TILT_FACTOR = 0.70f; // tilt boost stops at about 45 deg
+
+// Landing
+static constexpr uint32_t ON_GROUND_MS = 1000; // wants down but not moving this long = landed
+static constexpr float ON_GROUND_CLIMB_SPEED_M_S = 0.15f;
+static constexpr uint32_t MAX_LANDING_MS = 15000; // auto landing takes longer = disarm
+static constexpr float BLIND_LANDING_DROP = 0.04f; // under hover throttle when the height is lost
+static constexpr float TOO_HIGH_MARGIN_M = 1.0f; // this much over MAX_HEIGHT_M = land
+
+// BMP581
+static constexpr uint32_t BARO_POLL_US = 4000;
+static constexpr uint32_t BARO_TIMEOUT_MS = 250;
+static constexpr uint32_t BARO_SKIP_SAMPLES = 20; // first readings after setup thrown away
+static constexpr uint32_t BARO_READY_SAMPLES = 100;
+static constexpr float GROUND_PRESSURE_FILTER = 0.01f; // ground pressure follows the weather while disarmed
+static constexpr float UP_ACCEL_FILTER = 0.1f; // low pass on the up acceleration
 
 // Safety
 static constexpr float ARM_MAX_TILT_DEG = 20.0f;
 static constexpr float CRASH_TILT_DEG = 60.0f;
-static constexpr float ARM_MAX_THROTTLE = 0.05f;
 static constexpr uint32_t IMU_TIMEOUT_US = 100000; // 100 ms
 static constexpr uint32_t ESC_STARTUP_MS = 4000;
 
@@ -916,6 +961,68 @@ static Pid::Settings yaw_speed_pid_settings()
     return settings;
 }
 
+// height loop : in m, out climb speed m/s
+static Pid::Settings height_pid_settings()
+{
+    Pid::Settings settings;
+    settings.proportional_gain = HEIGHT_GAIN;
+    settings.output_limit = MAX_CLIMB_SPEED_M_S;
+    return settings;
+}
+
+// climb speed loop : in m/s, out throttle change from hover
+// I learns the real hover throttle
+static Pid::Settings climb_speed_pid_settings()
+{
+    Pid::Settings settings;
+    settings.proportional_gain = 0.10f;
+    settings.integral_gain = 0.05f;
+    settings.derivative_gain = 0.0f;
+    settings.integral_limit = MAX_THRUST_CHANGE;
+    settings.output_limit = MAX_THRUST_CHANGE;
+    return settings;
+}
+
+
+enum FlightPhase : uint8_t
+{
+    PHASE_DISARMED = 0,
+    PHASE_SPIN_UP,
+    PHASE_TAKEOFF,
+    PHASE_FLYING,
+    PHASE_LANDING,
+};
+
+static const char *phase_text(uint8_t phase)
+{
+    switch (phase)
+    {
+        case PHASE_SPIN_UP: return "SPIN UP";
+        case PHASE_TAKEOFF: return "TAKEOFF";
+        case PHASE_FLYING: return "FLYING";
+        case PHASE_LANDING: return "LANDING";
+        default: return "disarmed";
+    }
+}
+
+enum LandReason : uint8_t
+{
+    LAND_NONE = 0,
+    LAND_RC_LOST,
+    LAND_HEIGHT_LOST,
+    LAND_TOO_HIGH,
+};
+
+static const char *land_reason_text(uint8_t reason)
+{
+    switch (reason)
+    {
+        case LAND_RC_LOST: return "RC link lost";
+        case LAND_HEIGHT_LOST: return "height sensor lost";
+        case LAND_TOO_HIGH: return "too high";
+        default: return "-";
+    }
+}
 
 enum DisarmReason : uint8_t
 {
@@ -924,6 +1031,11 @@ enum DisarmReason : uint8_t
     DISARM_FAILSAFE,
     DISARM_IMU_TIMEOUT,
     DISARM_CRASH_TILT,
+    DISARM_LANDED,
+    DISARM_TAKEOFF_STOPPED,
+    DISARM_NO_LIFTOFF,
+    DISARM_HEIGHT_LOST,
+    DISARM_LANDING_TIMEOUT,
 };
 
 static const char *disarm_reason_text(uint8_t reason)
@@ -934,6 +1046,11 @@ static const char *disarm_reason_text(uint8_t reason)
         case DISARM_FAILSAFE: return "FAILSAFE: RC link lost";
         case DISARM_IMU_TIMEOUT: return "IMU stopped sending";
         case DISARM_CRASH_TILT: return "CRASH: tilt over limit";
+        case DISARM_LANDED: return "landed";
+        case DISARM_TAKEOFF_STOPPED: return "take off stopped, stick down";
+        case DISARM_NO_LIFTOFF: return "no lift off at max take off throttle";
+        case DISARM_HEIGHT_LOST: return "BMP581 / accel stopped on the ground";
+        case DISARM_LANDING_TIMEOUT: return "auto landing took too long";
         default: return "-";
     }
 }
@@ -943,15 +1060,22 @@ struct FlightStatus
 {
     bool armed;
     bool link_ok;
+    uint8_t phase;
+    uint8_t land_reason;
     uint8_t disarm_reason;
     const char *arm_blocked_by; // nullptr when nothing stops arming
-    float throttle;
+    float climb_stick;
+    float base_throttle; // all motors before roll / pitch / yaw
+    float hover_throttle;
+    float height, target_height;
+    float climb_speed, target_climb_speed;
     float roll_deg, pitch_deg, yaw_deg;
     float roll_speed, pitch_speed, yaw_speed; // deg/s
     float target_roll, target_pitch, target_yaw_speed;
     float motor_power[4];
     float compass_deg;
     uint16_t loop_hz;
+    uint16_t baro_hz;
     uint32_t time_ms;
 };
 
@@ -959,18 +1083,18 @@ static QueueHandle_t status_mailbox;
 
 
 // Centre stick -> -1 .. +1 with a small dead band
-static float stick_position(uint16_t value)
+static float stick_position(uint16_t value, float deadband)
 {
     float position = ((float)value - (float)CH_MID) / (float)(CH_MAX - CH_MID);
     if (position > 1.0f) position = 1.0f;
     if (position < -1.0f) position = -1.0f;
-    if (position > -STICK_DEADBAND && position < STICK_DEADBAND) return 0.0f;
+    if (position > -deadband && position < deadband) return 0.0f;
 
     if (position > 0.0f)
     {
-        return (position - STICK_DEADBAND) / (1.0f - STICK_DEADBAND);
+        return (position - deadband) / (1.0f - deadband);
     }
-    return (position + STICK_DEADBAND) / (1.0f - STICK_DEADBAND);
+    return (position + deadband) / (1.0f - deadband);
 }
 
 static void enable_flight_reports(BNO08x &bno)
@@ -982,6 +1106,10 @@ static void enable_flight_reports(BNO08x &bno)
     if (!bno.enableReport(SH2_GYROSCOPE_CALIBRATED, 2500)) // 400 Hz
     {
         DEBUG_PRINTF("Could not enable gyroscope\n");
+    }
+    if (!bno.enableReport(SH2_LINEAR_ACCELERATION, 5000)) // 200 Hz, for the height
+    {
+        DEBUG_PRINTF("Could not enable linear acceleration\n");
     }
     if (!bno.enableReport(SH2_ROTATION_VECTOR, 20000)) // 50 Hz, compass only
     {
@@ -995,8 +1123,13 @@ static Pid pitch_angle_pid(angle_pid_settings());
 static Pid roll_speed_pid(roll_pitch_speed_pid_settings());
 static Pid pitch_speed_pid(roll_pitch_speed_pid_settings());
 static Pid yaw_speed_pid(yaw_speed_pid_settings());
+static Pid height_pid(height_pid_settings());
+static Pid climb_speed_pid(climb_speed_pid_settings());
 
-static void reset_all_pids()
+// own filter, kf belongs to bno085_task
+static AltKalman height_filter;
+
+static void reset_attitude_pids()
 {
     roll_angle_pid.reset();
     pitch_angle_pid.reset();
@@ -1051,6 +1184,38 @@ void flight_control_task(void *pvParameters)
     bno.setDcdAutoSave(false);
     enable_flight_reports(bno);
 
+    //--------------------BMP581-------------------------//
+    // same setup as bno085_task
+    BMP5xx bmp(spi1, BMP5xx_CS_PIN);
+
+    bool bmp_found = bmp.initialize();
+    if (!bmp_found)
+    {
+        // no height, never arms
+        DEBUG_PRINTF("BMP5xx not found, status %d\n", bmp.lastStatus());
+    }
+    else
+    {
+        bmp.setTemperatureOversampling(BMP5XX_OVERSAMPLING_1X);
+        bmp.setPressureOversampling(BMP5XX_OVERSAMPLING_8X);
+        bmp.setIIRFilterCoeff(BMP5XX_IIR_FILTER_BYPASS);
+        bmp.setOutputDataRate(BMP5XX_ODR_10_HZ);
+        bmp.setPowerMode(BMP5XX_POWERMODE_CONTINUOUS);
+        bmp.enablePressure(true);
+        bmp.configureInterrupt(BMP5XX_INTERRUPT_LATCHED,
+                                BMP5XX_INTERRUPT_ACTIVE_HIGH,
+                                BMP5XX_INTERRUPT_PUSH_PULL,
+                                BMP5XX_INTERRUPT_DATA_READY,
+                                true);
+        DEBUG_PRINTF("BMP5xx found\n");
+    }
+
+    height_filter.setAccelNoise(0.1f);
+    height_filter.setBiasWalk(0.001f);
+    height_filter.setBaroNoise(0.3f);
+    height_filter.setGateSigma(4.0f);
+    height_filter.reset(0.0f);
+
     gpio_set_irq_enabled_with_callback(BNO08x_INT_PIN, GPIO_IRQ_EDGE_FALL, true, &bno_int_isr);
 
     // ========================================================//
@@ -1059,24 +1224,45 @@ void flight_control_task(void *pvParameters)
 
     float qr = 1.0f, qi = 0.0f, qj = 0.0f, qk = 0.0f;
     float gyro_x = 0.0f, gyro_y = 0.0f, gyro_z = 0.0f; // rad/s, BNO axes
+    float accel_x = 0.0f, accel_y = 0.0f, accel_z = 0.0f; // m/s^2 without gravity, BNO axes
     float roll_deg = 0.0f, pitch_deg = 0.0f, yaw_deg = 0.0f;
     float roll_speed = 0.0f, pitch_speed = 0.0f, yaw_speed = 0.0f; // deg/s
     float compass_deg = 0.0f;
 
-    uint32_t last_attitude_us = 0, last_gyro_us = 0, last_control_us = 0;
-    bool have_attitude = false, have_gyro = false;
+    uint32_t last_attitude_us = 0, last_gyro_us = 0, last_accel_us = 0, last_control_us = 0;
+    bool have_attitude = false, have_gyro = false, have_accel = false;
+
+    // height
+    float up_accel_filtered = 0.0f;
+    float ground_pressure = 0.0f; // hPa
+    uint32_t baro_samples = 0;
+    uint32_t last_baro_ms = 0, last_baro_poll_us = 0;
+    float target_height = 0.0f, target_climb_speed = 0.0f;
+    float hover_throttle = 0.0f; // throttle when it lifted off
+    float takeoff_throttle = 0.0f;
+    bool going_to_takeoff_height = false;
+    bool at_max_takeoff_throttle = false;
+    uint32_t max_takeoff_throttle_since_ms = 0;
+    bool maybe_on_ground = false;
+    uint32_t maybe_on_ground_since_ms = 0;
 
     RcInput rc = {};
     bool have_rc = false;
     bool armed = false;
     bool arm_switch_was_off = false; // switch has to be seen OFF before arming
     bool motors_at_limit = false;
+    uint8_t phase = PHASE_DISARMED;
+    uint32_t phase_start_ms = 0;
+    uint8_t land_reason = LAND_NONE;
     uint8_t disarm_reason = DISARM_NONE;
+    uint8_t control_disarm = DISARM_NONE; // set by the control part, done next loop
 
     float target_roll = 0.0f, target_pitch = 0.0f, target_yaw_speed = 0.0f;
+    float base_throttle = 0.0f;
     float motor_power[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    uint32_t loop_count = 0, loop_hz = 0, last_hz_ms = 0, last_status_ms = 0;
+    uint32_t loop_count = 0, loop_hz = 0, baro_count = 0, baro_hz = 0;
+    uint32_t last_hz_ms = 0, last_status_ms = 0;
 
 
     while (true)
@@ -1091,6 +1277,7 @@ void flight_control_task(void *pvParameters)
         }
 
         bool new_attitude = false;
+        bool new_accel = false;
         while (bno.getSensorEvent(&value))
         {
             if (value.sensorId == SH2_GAME_ROTATION_VECTOR)
@@ -1109,6 +1296,13 @@ void flight_control_task(void *pvParameters)
                 last_gyro_us = time_us_32();
                 have_gyro = true;
             }
+            else if (value.sensorId == SH2_LINEAR_ACCELERATION)
+            {
+                accel_x = value.un.linearAcceleration.x;
+                accel_y = value.un.linearAcceleration.y;
+                accel_z = value.un.linearAcceleration.z;
+                new_accel = true;
+            }
             else if (value.sensorId == SH2_ROTATION_VECTOR)
             {
                 // compass heading, print only
@@ -1125,6 +1319,7 @@ void flight_control_task(void *pvParameters)
         }
 
         uint32_t now_us = time_us_32();
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
 
         if (new_attitude)
         {
@@ -1151,19 +1346,71 @@ void flight_control_task(void *pvParameters)
         pitch_speed = IMU_PITCH_DIRECTION * gyro_y * RAD2DEG;
         yaw_speed = IMU_YAW_DIRECTION * gyro_z * RAD2DEG;
 
+        //--------------------Height-------------------------//
+        // up acceleration -> Kalman predict, every accel sample
+        if (new_accel)
+        {
+            float accel_time_step = (now_us - last_accel_us) * 1e-6f;
+            last_accel_us = now_us;
+            have_accel = true;
+
+            float up_accel = world_up_accel(qr, qi, qj, qk, accel_x, accel_y, accel_z);
+            up_accel_filtered += UP_ACCEL_FILTER * (up_accel - up_accel_filtered);
+            height_filter.predict(up_accel_filtered, accel_time_step); // skips steps over 0.1 s
+        }
+
+        // BMP581 -> Kalman update, every new pressure
+        if (bmp_found && now_us - last_baro_poll_us >= BARO_POLL_US)
+        {
+            last_baro_poll_us = now_us;
+            if (bmp.dataReady() && bmp.performReading())
+            {
+                baro_count++;
+                if (baro_samples < BARO_READY_SAMPLES) baro_samples++;
+
+                if (baro_samples == BARO_SKIP_SAMPLES)
+                {
+                    ground_pressure = bmp.pressure;
+                    baro_set_ground(ground_pressure);
+                }
+                else if (baro_samples > BARO_SKIP_SAMPLES)
+                {
+                    if (!armed)
+                    {
+                        // on the ground, ground pressure follows the weather
+                        ground_pressure += GROUND_PRESSURE_FILTER * (bmp.pressure - ground_pressure);
+                        baro_set_ground(ground_pressure);
+                    }
+                    height_filter.updateBaro(baro_altitude_m(bmp.pressure));
+                    last_baro_ms = now_ms;
+                }
+            }
+        }
+
+        bool baro_ok = baro_samples >= BARO_READY_SAMPLES && (now_ms - last_baro_ms) < BARO_TIMEOUT_MS;
+        bool accel_ok = have_accel && (now_us - last_accel_us) < IMU_TIMEOUT_US;
+        bool height_ok = baro_ok && accel_ok;
+        float height = height_filter.altitude();
+        float climb_speed = height_filter.climbRate();
+
         //--------------------RC-------------------------//
         if (xQueuePeek(rc_mailbox, &rc, 0) == pdTRUE) have_rc = true;
 
-        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
         bool link_ok = have_rc && (now_ms - rc.time_ms) < FAILSAFE_MS;
         bool arm_switch = link_ok && rc.ch[CH_ARM] > CH_MID;
-        float throttle = link_ok ? stick_to_throttle(rc.ch[CH_THROTTLE]) : 0.0f;
+        float climb_stick = 0.0f;
+        if (link_ok)
+        {
+            climb_stick = THROTTLE_STICK_DIRECTION * stick_position(rc.ch[CH_THROTTLE], THROTTLE_STICK_DEADBAND);
+        }
 
         if (link_ok && rc.ch[CH_ARM] <= CH_MID) arm_switch_was_off = true;
 
         bool imu_ok = have_attitude && have_gyro &&
                       (now_us - last_attitude_us) < IMU_TIMEOUT_US &&
                       (now_us - last_gyro_us) < IMU_TIMEOUT_US;
+
+        bool in_the_air = (phase == PHASE_FLYING || phase == PHASE_LANDING);
 
         //--------------------Arm / Disarm-------------------------//
         const char *arm_blocked_by = nullptr;
@@ -1182,13 +1429,21 @@ void flight_control_task(void *pvParameters)
             {
                 arm_blocked_by = "IMU not ready";
             }
+            else if (!baro_ok)
+            {
+                arm_blocked_by = "BMP581 not ready";
+            }
+            else if (!accel_ok)
+            {
+                arm_blocked_by = "accel not ready";
+            }
             else if (!arm_switch_was_off)
             {
                 arm_blocked_by = "arm switch OFF first";
             }
-            else if (throttle > ARM_MAX_THROTTLE)
+            else if (climb_stick != 0.0f)
             {
-                arm_blocked_by = "throttle not down";
+                arm_blocked_by = "throttle stick not centred";
             }
             else if (fabsf(roll_deg) > ARM_MAX_TILT_DEG || fabsf(pitch_deg) > ARM_MAX_TILT_DEG)
             {
@@ -1197,21 +1452,35 @@ void flight_control_task(void *pvParameters)
 
             if (arm_switch && arm_blocked_by == nullptr)
             {
-                reset_all_pids();
+                reset_attitude_pids();
+                height_pid.reset();
+                climb_speed_pid.reset();
+
+                // height 0 = here
+                baro_set_ground(ground_pressure);
+                height_filter.reset(0.0f);
+
                 motors.arm();
                 armed = true;
+                phase = PHASE_SPIN_UP;
+                phase_start_ms = now_ms;
+                land_reason = LAND_NONE;
                 disarm_reason = DISARM_NONE;
+                control_disarm = DISARM_NONE;
+                maybe_on_ground = false;
+                at_max_takeoff_throttle = false;
                 last_control_us = now_us;
             }
         }
         else
         {
             uint8_t reason = DISARM_NONE;
-            if (!link_ok)
+            if (!link_ok && !in_the_air)
             {
+                // RC lost on the ground: stop
                 reason = DISARM_FAILSAFE;
             }
-            else if (!arm_switch)
+            else if (link_ok && !arm_switch)
             {
                 reason = DISARM_SWITCH;
             }
@@ -1223,14 +1492,69 @@ void flight_control_task(void *pvParameters)
             {
                 reason = DISARM_CRASH_TILT;
             }
+            else if (control_disarm != DISARM_NONE)
+            {
+                reason = control_disarm;
+            }
+
+            if (reason == DISARM_NONE && !link_ok && phase != PHASE_LANDING)
+            {
+                // RC lost in the air: land
+                phase = PHASE_LANDING;
+                phase_start_ms = now_ms;
+                land_reason = LAND_RC_LOST;
+            }
+
+            if (reason == DISARM_NONE && !height_ok)
+            {
+                if (!in_the_air)
+                {
+                    reason = DISARM_HEIGHT_LOST;
+                }
+                else if (phase != PHASE_LANDING)
+                {
+                    phase = PHASE_LANDING;
+                    phase_start_ms = now_ms;
+                    land_reason = LAND_HEIGHT_LOST;
+                }
+            }
+
+            if (reason == DISARM_NONE && phase == PHASE_FLYING && height > MAX_HEIGHT_M + TOO_HIGH_MARGIN_M)
+            {
+                phase = PHASE_LANDING;
+                phase_start_ms = now_ms;
+                land_reason = LAND_TOO_HIGH;
+            }
+
+            // RC back during an RC lost landing, hold here again
+            if (reason == DISARM_NONE && phase == PHASE_LANDING && land_reason == LAND_RC_LOST && arm_switch && height_ok)
+            {
+                phase = PHASE_FLYING;
+                phase_start_ms = now_ms;
+                land_reason = LAND_NONE;
+                target_height = height;
+                going_to_takeoff_height = false;
+                height_pid.reset();
+            }
+
+            if (reason == DISARM_NONE && phase == PHASE_LANDING && now_ms - phase_start_ms > MAX_LANDING_MS)
+            {
+                reason = DISARM_LANDING_TIMEOUT;
+            }
 
             if (reason != DISARM_NONE)
             {
                 motors.disarm();
                 armed = false;
+                phase = PHASE_DISARMED;
                 disarm_reason = reason;
+                control_disarm = DISARM_NONE;
                 arm_switch_was_off = false; // switch has to go OFF again
-                reset_all_pids();
+                reset_attitude_pids();
+                height_pid.reset();
+                climb_speed_pid.reset();
+                base_throttle = 0.0f;
+                target_climb_speed = 0.0f;
                 for (int i = 0; i < 4; i++) motor_power[i] = 0.0f;
             }
         }
@@ -1244,21 +1568,170 @@ void flight_control_task(void *pvParameters)
             if (time_step < 0.0005f) time_step = 0.0005f;
             if (time_step > 0.02f) time_step = 0.02f;
 
-            target_roll = ROLL_STICK_DIRECTION * stick_position(rc.ch[CH_ROLL]) * MAX_TILT_ANGLE_DEG;
-            target_pitch = -PITCH_STICK_DIRECTION * stick_position(rc.ch[CH_PITCH]) * MAX_TILT_ANGLE_DEG; // forward = nose down
-            target_yaw_speed = YAW_STICK_DIRECTION * stick_position(rc.ch[CH_YAW]) * MAX_YAW_SPEED_DEG_S;
-
-            if (throttle < PID_START_THROTTLE)
+            if (link_ok)
             {
-                // throttle down, all motors idle
-                reset_all_pids();
+                target_roll = ROLL_STICK_DIRECTION * stick_position(rc.ch[CH_ROLL], STICK_DEADBAND) * MAX_TILT_ANGLE_DEG;
+                target_pitch = -PITCH_STICK_DIRECTION * stick_position(rc.ch[CH_PITCH], STICK_DEADBAND) * MAX_TILT_ANGLE_DEG; // forward = nose down
+                target_yaw_speed = YAW_STICK_DIRECTION * stick_position(rc.ch[CH_YAW], STICK_DEADBAND) * MAX_YAW_SPEED_DEG_S;
+            }
+            else
+            {
+                // RC lost, stay level
+                target_roll = 0.0f;
+                target_pitch = 0.0f;
+                target_yaw_speed = 0.0f;
+            }
+
+            //--------------------Height control-------------------------//
+            if (phase == PHASE_SPIN_UP)
+            {
+                // props at idle for a moment
+                base_throttle = 0.0f;
+                target_climb_speed = 0.0f;
+                if (climb_stick < -0.5f)
+                {
+                    control_disarm = DISARM_TAKEOFF_STOPPED;
+                }
+                else if (now_ms - phase_start_ms >= SPIN_UP_MS)
+                {
+                    phase = PHASE_TAKEOFF;
+                    phase_start_ms = now_ms;
+                    takeoff_throttle = TAKEOFF_START_THROTTLE;
+                    at_max_takeoff_throttle = false;
+                }
+            }
+            else if (phase == PHASE_TAKEOFF)
+            {
+                // throttle goes up slowly until it lifts off
+                takeoff_throttle += TAKEOFF_THROTTLE_RAMP * time_step;
+                if (takeoff_throttle >= TAKEOFF_MAX_THROTTLE)
+                {
+                    takeoff_throttle = TAKEOFF_MAX_THROTTLE;
+                    if (!at_max_takeoff_throttle)
+                    {
+                        at_max_takeoff_throttle = true;
+                        max_takeoff_throttle_since_ms = now_ms;
+                    }
+                }
+                base_throttle = takeoff_throttle;
+                target_climb_speed = 0.0f;
+
+                if (climb_stick < -0.5f)
+                {
+                    control_disarm = DISARM_TAKEOFF_STOPPED;
+                }
+                else if (height > LIFTOFF_HEIGHT_M && climb_speed > LIFTOFF_CLIMB_SPEED_M_S)
+                {
+                    // lifted off, this throttle is about hover
+                    hover_throttle = takeoff_throttle;
+                    height_pid.reset();
+                    climb_speed_pid.reset();
+                    target_height = height;
+                    going_to_takeoff_height = true;
+                    maybe_on_ground = false;
+                    phase = PHASE_FLYING;
+                    phase_start_ms = now_ms;
+                }
+                else if (at_max_takeoff_throttle && now_ms - max_takeoff_throttle_since_ms >= NO_LIFTOFF_MS)
+                {
+                    control_disarm = DISARM_NO_LIFTOFF;
+                }
+            }
+            else if (phase == PHASE_FLYING || phase == PHASE_LANDING)
+            {
+                if (phase == PHASE_LANDING)
+                {
+                    target_climb_speed = -LANDING_SPEED_M_S;
+                    target_height = height;
+                }
+                else if (climb_stick != 0.0f)
+                {
+                    // stick out of the middle = climb speed, hold where it is let go
+                    going_to_takeoff_height = false;
+                    target_climb_speed = climb_stick * MAX_CLIMB_SPEED_M_S;
+                    target_height = height;
+                    height_pid.reset();
+                }
+                else
+                {
+                    // stick in the middle = hold height
+                    if (going_to_takeoff_height)
+                    {
+                        target_height += TAKEOFF_CLIMB_SPEED_M_S * time_step;
+                        if (target_height >= TAKEOFF_HEIGHT_M)
+                        {
+                            target_height = TAKEOFF_HEIGHT_M;
+                            going_to_takeoff_height = false;
+                        }
+                    }
+                    if (target_height > MAX_HEIGHT_M) target_height = MAX_HEIGHT_M;
+                    target_climb_speed = height_pid.calculate(target_height, height, time_step);
+                }
+
+                // slow down near the max height
+                float room_to_climb = (MAX_HEIGHT_M - height) * HEIGHT_GAIN;
+                if (room_to_climb < 0.0f) room_to_climb = 0.0f;
+                if (target_climb_speed > room_to_climb) target_climb_speed = room_to_climb;
+
+                // slow down near the ground
+                if (height < SLOW_DOWN_HEIGHT_M && target_climb_speed < -LANDING_SPEED_M_S)
+                {
+                    target_climb_speed = -LANDING_SPEED_M_S;
+                }
+
+                float thrust_change = 0.0f;
+                if (height_ok)
+                {
+                    climb_speed_pid.hold_integral(motors_at_limit);
+                    thrust_change = climb_speed_pid.calculate(target_climb_speed, climb_speed, time_step);
+                }
+                else
+                {
+                    // height lost, come down on the learned hover throttle
+                    thrust_change = climb_speed_pid.get_integral_part() - BLIND_LANDING_DROP;
+                }
+
+                // tilted = less lift, a bit more throttle
+                float tilt_factor = cosf(roll_deg / RAD2DEG) * cosf(pitch_deg / RAD2DEG);
+                if (tilt_factor < MIN_TILT_FACTOR) tilt_factor = MIN_TILT_FACTOR;
+
+                base_throttle = (hover_throttle + thrust_change) / tilt_factor;
+                if (base_throttle < MIN_FLYING_THROTTLE) base_throttle = MIN_FLYING_THROTTLE;
+                if (base_throttle > MAX_FLYING_THROTTLE) base_throttle = MAX_FLYING_THROTTLE;
+
+                // wants down, not moving, less than hover = on the ground
+                bool wants_down = target_climb_speed < -ON_GROUND_CLIMB_SPEED_M_S;
+                bool not_moving = fabsf(climb_speed) < ON_GROUND_CLIMB_SPEED_M_S;
+                if (height_ok && wants_down && not_moving && thrust_change < 0.0f)
+                {
+                    if (!maybe_on_ground)
+                    {
+                        maybe_on_ground = true;
+                        maybe_on_ground_since_ms = now_ms;
+                    }
+                    else if (now_ms - maybe_on_ground_since_ms >= ON_GROUND_MS)
+                    {
+                        control_disarm = DISARM_LANDED;
+                    }
+                }
+                else
+                {
+                    maybe_on_ground = false;
+                }
+            }
+
+            //--------------------Attitude control-------------------------//
+            if (base_throttle < PID_START_THROTTLE)
+            {
+                // spin up, all motors idle
+                reset_attitude_pids();
                 motors_at_limit = false;
                 for (int i = 0; i < 4; i++) motor_power[i] = 0.0f;
             }
             else
             {
                 // no I on the ground or when a motor is at its limit
-                bool freeze_integral = (throttle < INTEGRAL_START_THROTTLE) || motors_at_limit;
+                bool freeze_integral = !in_the_air || motors_at_limit;
                 roll_speed_pid.hold_integral(freeze_integral);
                 pitch_speed_pid.hold_integral(freeze_integral);
                 yaw_speed_pid.hold_integral(freeze_integral);
@@ -1275,7 +1748,7 @@ void flight_control_task(void *pvParameters)
                 float highest = -1e9f, lowest = 1e9f;
                 for (int i = 0; i < 4; i++)
                 {
-                    motor_power[i] = throttle;
+                    motor_power[i] = base_throttle;
                     motor_power[i] += roll_correction * motor_mix[i].roll;
                     motor_power[i] += pitch_correction * motor_mix[i].pitch;
                     motor_power[i] += yaw_correction * motor_mix[i].yaw;
@@ -1316,7 +1789,9 @@ void flight_control_task(void *pvParameters)
         if (now_ms - last_hz_ms >= 1000)
         {
             loop_hz = loop_count;
+            baro_hz = baro_count;
             loop_count = 0;
+            baro_count = 0;
             last_hz_ms = now_ms;
         }
 
@@ -1327,9 +1802,17 @@ void flight_control_task(void *pvParameters)
             FlightStatus status;
             status.armed = armed;
             status.link_ok = link_ok;
+            status.phase = phase;
+            status.land_reason = land_reason;
             status.disarm_reason = disarm_reason;
             status.arm_blocked_by = arm_blocked_by;
-            status.throttle = throttle;
+            status.climb_stick = climb_stick;
+            status.base_throttle = armed ? base_throttle : 0.0f;
+            status.hover_throttle = hover_throttle;
+            status.height = height;
+            status.target_height = target_height;
+            status.climb_speed = climb_speed;
+            status.target_climb_speed = target_climb_speed;
             status.roll_deg = roll_deg;
             status.pitch_deg = pitch_deg;
             status.yaw_deg = yaw_deg;
@@ -1342,6 +1825,7 @@ void flight_control_task(void *pvParameters)
             for (int i = 0; i < 4; i++) status.motor_power[i] = armed ? motor_power[i] : 0.0f;
             status.compass_deg = compass_deg;
             status.loop_hz = (uint16_t)loop_hz;
+            status.baro_hz = (uint16_t)baro_hz;
             status.time_ms = now_ms;
 
             xQueueOverwrite(status_mailbox, &status);
@@ -1360,6 +1844,7 @@ void flight_telemetry_task(void *pvParameters)
 
     FlightStatus status;
     bool was_armed = false;
+    uint8_t last_phase = PHASE_DISARMED;
     uint8_t last_reason = DISARM_NONE;
     uint32_t last_print_ms = 0;
 
@@ -1380,21 +1865,40 @@ void flight_telemetry_task(void *pvParameters)
             {
                 printf(">>> DISARMED: %s\n", disarm_reason_text(status.disarm_reason));
             }
+
+            if (status.armed && status.phase != last_phase)
+            {
+                if (status.phase == PHASE_LANDING)
+                {
+                    printf(">>> LANDING: %s\n", land_reason_text(status.land_reason));
+                }
+                else if (status.phase == PHASE_FLYING && last_phase == PHASE_TAKEOFF)
+                {
+                    printf(">>> LIFT OFF at throttle %.2f\n", status.hover_throttle);
+                }
+                else
+                {
+                    printf(">>> %s\n", phase_text(status.phase));
+                }
+            }
             was_armed = status.armed;
+            last_phase = status.phase;
             last_reason = status.disarm_reason;
 
             uint32_t now_ms = to_ms_since_boot(get_absolute_time());
             if (now_ms - last_print_ms >= 250) // 4 Hz
             {
                 last_print_ms = now_ms;
-                printf("%s link:%d thr:%.2f | R %6.1f sp %6.1f | P %6.1f sp %6.1f | "
-                       "Yr %6.0f sp %6.0f | M %.2f %.2f %.2f %.2f | %u Hz",
-                       status.armed ? "ARMED" : "disarmed", status.link_ok, status.throttle,
+                printf("%s link:%d stick:%+.2f | H %5.2f tg %5.2f vs %+5.2f tg %+5.2f | thr %.2f hov %.2f | "
+                       "R %6.1f sp %6.1f | P %6.1f sp %6.1f | Yr %6.0f sp %6.0f | M %.2f %.2f %.2f %.2f | %u Hz baro %u Hz",
+                       phase_text(status.phase), status.link_ok, status.climb_stick,
+                       status.height, status.target_height, status.climb_speed, status.target_climb_speed,
+                       status.base_throttle, status.hover_throttle,
                        status.roll_deg, status.target_roll, status.pitch_deg, status.target_pitch,
                        status.yaw_speed, status.target_yaw_speed,
                        status.motor_power[0], status.motor_power[1],
                        status.motor_power[2], status.motor_power[3],
-                       status.loop_hz);
+                       status.loop_hz, status.baro_hz);
                 if (!status.armed && status.arm_blocked_by) printf(" | no arm: %s", status.arm_blocked_by);
                 printf("\n");
             }

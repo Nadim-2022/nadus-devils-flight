@@ -1,0 +1,16 @@
+; Serial receive (8N1) for the MTF-01P on a PIO state machine
+; 8 PIO clocks per bit, same idea as uart_rx in pico-examples
+
+.program mtf01p_uart_rx
+
+start:
+    wait 0 pin 0        ; wait for the start bit
+    set x, 7 [10]       ; then wait to the middle of the first bit
+bit_loop:
+    in pins, 1          ; read one bit
+    jmp x-- bit_loop [6]
+    jmp pin good_stop   ; stop bit has to be high
+    wait 1 pin 0        ; bad frame, wait for the line to go idle
+    jmp start
+good_stop:
+    push

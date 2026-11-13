@@ -26,11 +26,16 @@ add_executable(${PROJECT_NAME}
         ../../external/sh2/sh2_util.c
         ../../external/sh2/sh2_SensorValue.c
         filter/AltKalman.cpp
+        filter/HeightFilter.cpp
         motor/Motors.cpp
         pid/Pid.cpp
+        sensors/Mtf01p.cpp
 
 )
 
+
+# MTF-01P serial input on PIO
+pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/sensors/Mtf01pUartRx.pio)
 
 # Include directories
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -64,6 +69,7 @@ target_link_libraries(${PROJECT_NAME}
         hardware_uart
         hardware_spi
         hardware_pwm
+        hardware_pio
 )
 
 pico_add_extra_outputs(${PROJECT_NAME})

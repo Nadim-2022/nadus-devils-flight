@@ -17,8 +17,10 @@
 #include "math.h"
 #include <ctype.h>
 #include "filter/AltKalman.h"
+#include "filter/HeightFilter.hpp"
 #include "queue.h"
 #include "pid/Pid.hpp"
+#include "sensors/Mtf01p.hpp"
 
 extern "C" {
     uint32_t read_runtime_ctr(void) { return timer_hw->timerawl; }
@@ -52,6 +54,11 @@ extern "C" {
 #define MOTOR2_PIN 20
 #define MOTOR3_PIN 21
 
+// MTF-01P optical flow, both UARTs taken so it's read with PIO
+// only the sensor Tx is wired, the sensor Rx is not used
+#define FLOW_SENSOR_RX_PIN 6 // sensor Tx -> GP6
+#define FLOW_SENSOR_BAUD 115200
+
 
 TaskHandle_t elrs_task_handle = NULL;
 TaskHandle_t core0_task_handle = NULL;
@@ -59,6 +66,7 @@ TaskHandle_t core1_task_handle = NULL;
 TaskHandle_t bmp581_task_handle = NULL;
 TaskHandle_t bno085_task_handle = NULL;
 TaskHandle_t motor_test_handle = NULL;
+TaskHandle_t optical_flow_task_handle = NULL;
 
 
 static constexpr float RAD2DEG = 57.2957795f;
@@ -71,6 +79,7 @@ struct RcInput {
 };
 
 static QueueHandle_t rc_mailbox;
+static QueueHandle_t flow_mailbox;
 
 // --- Channel setup (ELRS default AETR order) ---
 #define CH_THROTTLE   2      // CH3 = index 2
@@ -179,6 +188,33 @@ void core0_elrs_task(void *pvParameters) {
 }
 
 
+
+
+// ========================================================
+// MTF-01P optical flow + range (core 0)
+// newest reading goes to flow_mailbox
+// ========================================================
+void optical_flow_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    Sensors::Mtf01p flow_sensor(FLOW_SENSOR_RX_PIN, FLOW_SENSOR_BAUD);
+
+    if (!flow_sensor.begin())
+    {
+        DEBUG_PRINTF("MTF-01P not started, flying without it\n");
+        vTaskDelete(NULL);
+    }
+
+    while (true)
+    {
+        if (flow_sensor.read_frame())
+        {
+            xQueueOverwrite(flow_mailbox, &flow_sensor.reading);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
 
 
 void bmp581_task(void *pvParameters) {
@@ -816,6 +852,8 @@ void motor_task(void *pvParameters) {
 // roll / pitch : self level, stick = tilt angle
 // yaw : stick = turn speed
 // height : BMP581 + BNO085 up acceleration (AltKalman), throttle stick = climb speed
+// MTF-01P range used for the height up to 11 m, BMP581 above that
+// MTF-01P flow holds the position when the roll / pitch sticks are centred
 //
 // Throttle stick springs back to the middle
 // middle = hold height, up = climb, down = come down
@@ -883,7 +921,7 @@ static constexpr float PID_START_THROTTLE = 0.05f; // below this motors idle and
 
 // Height
 static constexpr float TAKEOFF_HEIGHT_M = 1.0f; // goes here after arming
-static constexpr float MAX_HEIGHT_M = 3.0f; // stick can't take it higher
+static constexpr float MAX_HEIGHT_M = 15.0f; // stick can't take it higher
 static constexpr float MAX_CLIMB_SPEED_M_S = 1.0f; // full stick up or down
 static constexpr float TAKEOFF_CLIMB_SPEED_M_S = 0.5f; // up to TAKEOFF_HEIGHT_M
 static constexpr float LANDING_SPEED_M_S = 0.3f;
@@ -919,6 +957,41 @@ static constexpr uint32_t BARO_SKIP_SAMPLES = 20; // first readings after setup 
 static constexpr uint32_t BARO_READY_SAMPLES = 100;
 static constexpr float GROUND_PRESSURE_FILTER = 0.01f; // ground pressure follows the weather while disarmed
 static constexpr float UP_ACCEL_FILTER = 0.1f; // low pass on the up acceleration
+static constexpr float BARO_NOISE_M = 0.3f;
+
+// MTF-01P range
+static constexpr bool USE_RANGE_SENSOR = true; // false = BMP581 only
+static constexpr float RANGE_MAX_HEIGHT_M = 11.0f; // sensor reaches 12 m, BMP581 above this
+static constexpr float RANGE_BLEND_M = 1.0f; // range slides over to BMP581 from 10 to 11 m
+static constexpr uint32_t RANGE_TIMEOUT_MS = 200;
+static constexpr float RANGE_NOISE_M = 0.05f;
+static constexpr float BARO_OFFSET_FILTER = 0.002f; // BMP581 follows the range height, per range sample (old filter)
+
+// true = 4 state filter, learns the BMP581 drift, throws away range jumps
+// false = old AltKalman + low pass BMP581 offset
+static constexpr bool USE_FOUR_STATE_HEIGHT = true;
+
+// MTF-01P optical flow
+static constexpr bool USE_FLOW_HOLD = true; // false = centred sticks only self level
+static constexpr uint32_t FLOW_TIMEOUT_MS = 100;
+static constexpr uint8_t FLOW_MIN_QUALITY = 50; // quality range not in the docs, check on the bench
+static constexpr float FLOW_MIN_HEIGHT_M = 0.30f;
+static constexpr float FLOW_MAX_HEIGHT_M = 5.0f;
+static constexpr float FLOW_MAX_TILT_DEG = 30.0f; // flow not used when tilted more
+static constexpr float FLOW_SPEED_FILTER = 0.3f; // low pass on the flow speed
+static constexpr bool FLOW_REMOVE_ROTATION = true; // take the gyro out of the flow
+
+// MTF-01P mounted under the frame looking down
+// assumed sensor X = forward, Y = right, not checked yet
+static constexpr bool FLOW_SWAP_AXES = false; // true = sensor Y is forward
+static constexpr float FLOW_FORWARD_DIRECTION = +1.0f;
+static constexpr float FLOW_RIGHT_DIRECTION = +1.0f;
+
+// Position hold
+static constexpr float POSITION_GAIN = 1.0f; // m/s back per m away from the hold point
+static constexpr float MAX_HOLD_SPEED_M_S = 1.0f;
+static constexpr float MAX_HOLD_TILT_DEG = 10.0f;
+static constexpr float BRAKE_DONE_SPEED_M_S = 0.3f; // sticks let go, hold point set below this speed
 
 // Safety
 static constexpr float ARM_MAX_TILT_DEG = 20.0f;
@@ -984,6 +1057,19 @@ static Pid::Settings climb_speed_pid_settings()
 }
 
 
+// flow speed loop : in m/s, out tilt angle deg
+static Pid::Settings flow_speed_pid_settings()
+{
+    Pid::Settings settings;
+    settings.proportional_gain = 6.0f;
+    settings.integral_gain = 1.0f;
+    settings.derivative_gain = 0.0f;
+    settings.integral_limit = 4.0f;
+    settings.output_limit = MAX_HOLD_TILT_DEG;
+    return settings;
+}
+
+
 enum FlightPhase : uint8_t
 {
     PHASE_DISARMED = 0,
@@ -1021,6 +1107,23 @@ static const char *land_reason_text(uint8_t reason)
         case LAND_HEIGHT_LOST: return "height sensor lost";
         case LAND_TOO_HIGH: return "too high";
         default: return "-";
+    }
+}
+
+enum HeightSource : uint8_t
+{
+    HEIGHT_FROM_BARO = 0,
+    HEIGHT_FROM_MIX,
+    HEIGHT_FROM_RANGE,
+};
+
+static const char *height_source_text(uint8_t source)
+{
+    switch (source)
+    {
+        case HEIGHT_FROM_RANGE: return "range";
+        case HEIGHT_FROM_MIX: return "mix";
+        default: return "baro";
     }
 }
 
@@ -1074,6 +1177,15 @@ struct FlightStatus
     float target_roll, target_pitch, target_yaw_speed;
     float motor_power[4];
     float compass_deg;
+    uint8_t height_source;
+    bool range_ok;
+    float range_height;
+    bool flow_ok;
+    bool flow_hold;
+    uint8_t flow_quality;
+    float forward_speed, right_speed; // m/s from the flow
+    float baro_offset; // BMP581 drift learned from the range
+    float floor_offset; // range floor moved (table, step)
     uint16_t loop_hz;
     uint16_t baro_hz;
     uint32_t time_ms;
@@ -1125,9 +1237,12 @@ static Pid pitch_speed_pid(roll_pitch_speed_pid_settings());
 static Pid yaw_speed_pid(yaw_speed_pid_settings());
 static Pid height_pid(height_pid_settings());
 static Pid climb_speed_pid(climb_speed_pid_settings());
+static Pid forward_speed_pid(flow_speed_pid_settings());
+static Pid right_speed_pid(flow_speed_pid_settings());
 
 // own filter, kf belongs to bno085_task
 static AltKalman height_filter;
+static HeightFilter four_state_filter;
 
 static void reset_attitude_pids()
 {
@@ -1136,6 +1251,8 @@ static void reset_attitude_pids()
     roll_speed_pid.reset();
     pitch_speed_pid.reset();
     yaw_speed_pid.reset();
+    forward_speed_pid.reset();
+    right_speed_pid.reset();
 }
 
 
@@ -1212,9 +1329,18 @@ void flight_control_task(void *pvParameters)
 
     height_filter.setAccelNoise(0.1f);
     height_filter.setBiasWalk(0.001f);
-    height_filter.setBaroNoise(0.3f);
+    height_filter.setBaroNoise(BARO_NOISE_M);
     height_filter.setGateSigma(4.0f);
     height_filter.reset(0.0f);
+
+    HeightFilter::Settings four_state_settings;
+    four_state_settings.accel_noise = 0.1f;
+    four_state_settings.bias_walk = 0.001f;
+    four_state_settings.baro_noise = BARO_NOISE_M;
+    four_state_settings.baro_drift = 0.02f;
+    four_state_settings.gate_sigma = 4.0f;
+    four_state_filter.set_settings(four_state_settings);
+    four_state_filter.reset(0.0f);
 
     gpio_set_irq_enabled_with_callback(BNO08x_INT_PIN, GPIO_IRQ_EDGE_FALL, true, &bno_int_isr);
 
@@ -1245,6 +1371,29 @@ void flight_control_task(void *pvParameters)
     uint32_t max_takeoff_throttle_since_ms = 0;
     bool maybe_on_ground = false;
     uint32_t maybe_on_ground_since_ms = 0;
+    float baro_height = 0.0f;
+    bool have_baro_height = false;
+
+    // MTF-01P
+    Sensors::OpticalFlowReading flow = {};
+    bool have_flow = false;
+    uint32_t last_flow_frame = 0;
+    uint32_t last_flow_received_ms = 0;
+    bool have_range = false;
+    uint32_t last_range_ms = 0;
+    float range_height = 0.0f;
+    float range_ground_distance = 0.0f; // range on the ground when it armed
+    float range_weight = 0.0f; // 1 = range only, 0 = BMP581 only
+    float baro_offset = 0.0f; // range height - BMP581 height
+    uint8_t height_source = HEIGHT_FROM_BARO;
+
+    // flow position, x / y along the yaw it had when it started
+    bool flow_usable = false;
+    float forward_speed = 0.0f, right_speed = 0.0f; // m/s
+    float position_x = 0.0f, position_y = 0.0f;
+    float hold_x = 0.0f, hold_y = 0.0f;
+    bool flow_holding = false;
+    bool hold_point_set = false;
 
     RcInput rc = {};
     bool have_rc = false;
@@ -1357,6 +1506,80 @@ void flight_control_task(void *pvParameters)
             float up_accel = world_up_accel(qr, qi, qj, qk, accel_x, accel_y, accel_z);
             up_accel_filtered += UP_ACCEL_FILTER * (up_accel - up_accel_filtered);
             height_filter.predict(up_accel_filtered, accel_time_step); // skips steps over 0.1 s
+            four_state_filter.predict(up_accel_filtered, accel_time_step);
+        }
+
+        //--------------------MTF-01P-------------------------//
+        bool new_flow = false;
+        if (xQueuePeek(flow_mailbox, &flow, 0) == pdTRUE && flow.frame_count != last_flow_frame)
+        {
+            last_flow_frame = flow.frame_count;
+            new_flow = true;
+            have_flow = true;
+        }
+
+        float level_factor = cosf(roll_deg / RAD2DEG) * cosf(pitch_deg / RAD2DEG);
+
+        if (USE_RANGE_SENSOR && new_flow && flow.distance_ok)
+        {
+            // range is along the tilted sensor, straight down is shorter
+            range_height = flow.distance_m * level_factor - range_ground_distance;
+            last_range_ms = now_ms;
+            have_range = true;
+        }
+        bool range_ok = have_range && (now_ms - last_range_ms) < RANGE_TIMEOUT_MS;
+
+        // 1 up to 10 m, 0 from 11 m
+        range_weight = 0.0f;
+        if (range_ok)
+        {
+            if (range_height <= RANGE_MAX_HEIGHT_M - RANGE_BLEND_M)
+            {
+                range_weight = 1.0f;
+            }
+            else if (range_height < RANGE_MAX_HEIGHT_M)
+            {
+                range_weight = (RANGE_MAX_HEIGHT_M - range_height) / RANGE_BLEND_M;
+            }
+        }
+
+        if (range_weight >= 1.0f)
+        {
+            height_source = HEIGHT_FROM_RANGE;
+        }
+        else if (range_weight > 0.0f)
+        {
+            height_source = HEIGHT_FROM_MIX;
+        }
+        else
+        {
+            height_source = HEIGHT_FROM_BARO;
+        }
+
+        // range -> Kalman update, every new range
+        if (new_flow && flow.distance_ok && range_weight > 0.0f)
+        {
+            float measured_height = range_height;
+            if (have_baro_height)
+            {
+                if (range_weight >= 1.0f)
+                {
+                    // BMP581 learns the range height, no jump when it takes over
+                    baro_offset += BARO_OFFSET_FILTER * (range_height - baro_height - baro_offset);
+                }
+                else
+                {
+                    // 10 to 11 m, slide over to the BMP581
+                    measured_height = range_weight * range_height + (1.0f - range_weight) * (baro_height + baro_offset);
+                }
+            }
+            // same update as the BMP581, range is just less noisy
+            height_filter.setBaroNoise(range_weight * RANGE_NOISE_M + (1.0f - range_weight) * BARO_NOISE_M);
+            height_filter.updateBaro(measured_height);
+
+            // 10 to 11 m the range counts less and less
+            float weight_for_noise = range_weight > 0.05f ? range_weight : 0.05f;
+            four_state_filter.update_range(range_height, RANGE_NOISE_M / weight_for_noise);
         }
 
         // BMP581 -> Kalman update, every new pressure
@@ -1381,17 +1604,74 @@ void flight_control_task(void *pvParameters)
                         ground_pressure += GROUND_PRESSURE_FILTER * (bmp.pressure - ground_pressure);
                         baro_set_ground(ground_pressure);
                     }
-                    height_filter.updateBaro(baro_altitude_m(bmp.pressure));
+                    baro_height = baro_altitude_m(bmp.pressure);
+                    have_baro_height = true;
                     last_baro_ms = now_ms;
+                    four_state_filter.update_baro(baro_height);
+
+                    // only when the range is not used
+                    if (range_weight <= 0.0f)
+                    {
+                        height_filter.setBaroNoise(BARO_NOISE_M);
+                        height_filter.updateBaro(baro_height + baro_offset);
+                    }
                 }
             }
         }
 
         bool baro_ok = baro_samples >= BARO_READY_SAMPLES && (now_ms - last_baro_ms) < BARO_TIMEOUT_MS;
         bool accel_ok = have_accel && (now_us - last_accel_us) < IMU_TIMEOUT_US;
-        bool height_ok = baro_ok && accel_ok;
+        bool height_ok = (baro_ok || range_ok) && accel_ok;
         float height = height_filter.altitude();
         float climb_speed = height_filter.climbRate();
+        if (USE_FOUR_STATE_HEIGHT)
+        {
+            height = four_state_filter.get_height();
+            climb_speed = four_state_filter.get_climb_speed();
+        }
+
+        //--------------------Optical flow-------------------------//
+        bool flow_fresh = have_flow && (now_ms - flow.received_ms) < FLOW_TIMEOUT_MS;
+        bool flow_was_usable = flow_usable;
+        flow_usable = USE_FLOW_HOLD && flow_fresh && flow.flow_ok && flow.distance_ok &&
+                      flow.flow_quality >= FLOW_MIN_QUALITY &&
+                      flow.distance_m >= FLOW_MIN_HEIGHT_M && flow.distance_m <= FLOW_MAX_HEIGHT_M &&
+                      fabsf(roll_deg) < FLOW_MAX_TILT_DEG && fabsf(pitch_deg) < FLOW_MAX_TILT_DEG;
+
+        if (flow_usable && !flow_was_usable)
+        {
+            forward_speed = 0.0f;
+            right_speed = 0.0f;
+            last_flow_received_ms = flow.received_ms;
+        }
+
+        if (new_flow && flow_usable)
+        {
+            float flow_forward = FLOW_SWAP_AXES ? flow.flow_y : flow.flow_x;
+            float flow_right = FLOW_SWAP_AXES ? flow.flow_x : flow.flow_y;
+            flow_forward *= FLOW_FORWARD_DIRECTION;
+            flow_right *= FLOW_RIGHT_DIRECTION;
+
+            if (FLOW_REMOVE_ROTATION)
+            {
+                // nose down looks like going forward, roll right looks like going right
+                flow_forward += pitch_speed / RAD2DEG;
+                flow_right -= roll_speed / RAD2DEG;
+            }
+
+            // flow is per metre, times the distance = ground speed
+            forward_speed += FLOW_SPEED_FILTER * (flow_forward * flow.distance_m - forward_speed);
+            right_speed += FLOW_SPEED_FILTER * (flow_right * flow.distance_m - right_speed);
+
+            float flow_time_step = (flow.received_ms - last_flow_received_ms) * 0.001f;
+            last_flow_received_ms = flow.received_ms;
+            if (flow_time_step <= 0.0f || flow_time_step > 0.1f) flow_time_step = 0.01f;
+
+            // turned with the yaw so the hold point stays put when it yaws
+            float yaw_rad = yaw_deg / RAD2DEG;
+            position_x += (forward_speed * cosf(yaw_rad) - right_speed * sinf(yaw_rad)) * flow_time_step;
+            position_y += (forward_speed * sinf(yaw_rad) + right_speed * cosf(yaw_rad)) * flow_time_step;
+        }
 
         //--------------------RC-------------------------//
         if (xQueuePeek(rc_mailbox, &rc, 0) == pdTRUE) have_rc = true;
@@ -1459,6 +1739,15 @@ void flight_control_task(void *pvParameters)
                 // height 0 = here
                 baro_set_ground(ground_pressure);
                 height_filter.reset(0.0f);
+                four_state_filter.reset(0.0f);
+                baro_offset = 0.0f;
+                range_ground_distance = 0.0f;
+                if (range_ok && flow.distance_ok)
+                {
+                    range_ground_distance = flow.distance_m * level_factor;
+                }
+                range_height = 0.0f;
+                flow_holding = false;
 
                 motors.arm();
                 armed = true;
@@ -1580,6 +1869,60 @@ void flight_control_task(void *pvParameters)
                 target_roll = 0.0f;
                 target_pitch = 0.0f;
                 target_yaw_speed = 0.0f;
+            }
+
+            //--------------------Position hold-------------------------//
+            // sticks centred + good flow = hold here, otherwise plain self level
+            bool sticks_centred = target_roll == 0.0f && target_pitch == 0.0f;
+            bool can_hold = flow_usable && sticks_centred && (phase == PHASE_FLYING || phase == PHASE_LANDING);
+
+            if (can_hold)
+            {
+                if (!flow_holding)
+                {
+                    flow_holding = true;
+                    hold_point_set = false;
+                    forward_speed_pid.reset();
+                    right_speed_pid.reset();
+                }
+
+                float target_forward_speed = 0.0f;
+                float target_right_speed = 0.0f;
+
+                if (!hold_point_set)
+                {
+                    // sticks just let go, stop first then hold there
+                    if (fabsf(forward_speed) < BRAKE_DONE_SPEED_M_S && fabsf(right_speed) < BRAKE_DONE_SPEED_M_S)
+                    {
+                        hold_x = position_x;
+                        hold_y = position_y;
+                        hold_point_set = true;
+                    }
+                }
+                else
+                {
+                    // distance to the hold point, turned back to forward / right
+                    float yaw_rad = yaw_deg / RAD2DEG;
+                    float error_x = hold_x - position_x;
+                    float error_y = hold_y - position_y;
+                    float error_forward = error_x * cosf(yaw_rad) + error_y * sinf(yaw_rad);
+                    float error_right = -error_x * sinf(yaw_rad) + error_y * cosf(yaw_rad);
+
+                    target_forward_speed = POSITION_GAIN * error_forward;
+                    target_right_speed = POSITION_GAIN * error_right;
+                    if (target_forward_speed > MAX_HOLD_SPEED_M_S) target_forward_speed = MAX_HOLD_SPEED_M_S;
+                    if (target_forward_speed < -MAX_HOLD_SPEED_M_S) target_forward_speed = -MAX_HOLD_SPEED_M_S;
+                    if (target_right_speed > MAX_HOLD_SPEED_M_S) target_right_speed = MAX_HOLD_SPEED_M_S;
+                    if (target_right_speed < -MAX_HOLD_SPEED_M_S) target_right_speed = -MAX_HOLD_SPEED_M_S;
+                }
+
+                // nose down to go forward, right side down to go right
+                target_pitch = -forward_speed_pid.calculate(target_forward_speed, forward_speed, time_step);
+                target_roll = right_speed_pid.calculate(target_right_speed, right_speed, time_step);
+            }
+            else
+            {
+                flow_holding = false;
             }
 
             //--------------------Height control-------------------------//
@@ -1824,6 +2167,16 @@ void flight_control_task(void *pvParameters)
             status.target_yaw_speed = target_yaw_speed;
             for (int i = 0; i < 4; i++) status.motor_power[i] = armed ? motor_power[i] : 0.0f;
             status.compass_deg = compass_deg;
+            status.height_source = height_source;
+            status.range_ok = range_ok;
+            status.range_height = range_height;
+            status.flow_ok = flow_usable;
+            status.flow_hold = armed && flow_holding;
+            status.flow_quality = flow.flow_quality;
+            status.forward_speed = forward_speed;
+            status.right_speed = right_speed;
+            status.baro_offset = USE_FOUR_STATE_HEIGHT ? four_state_filter.get_baro_offset() : baro_offset;
+            status.floor_offset = USE_FOUR_STATE_HEIGHT ? four_state_filter.get_floor_offset() : 0.0f;
             status.loop_hz = (uint16_t)loop_hz;
             status.baro_hz = (uint16_t)baro_hz;
             status.time_ms = now_ms;
@@ -1899,6 +2252,11 @@ void flight_telemetry_task(void *pvParameters)
                        status.motor_power[0], status.motor_power[1],
                        status.motor_power[2], status.motor_power[3],
                        status.loop_hz, status.baro_hz);
+                printf(" | %s rng %d %5.2f boff %+.2f floor %+.2f | flow %d q %3u hold %d fwd %+.2f right %+.2f",
+                       height_source_text(status.height_source), status.range_ok, status.range_height,
+                       status.baro_offset, status.floor_offset,
+                       status.flow_ok, status.flow_quality, status.flow_hold,
+                       status.forward_speed, status.right_speed);
                 if (!status.armed && status.arm_blocked_by) printf(" | no arm: %s", status.arm_blocked_by);
                 printf("\n");
             }
@@ -1936,12 +2294,14 @@ int main() {
 
     rc_mailbox = xQueueCreate(1, sizeof(RcInput));
     status_mailbox = xQueueCreate(1, sizeof(FlightStatus));
+    flow_mailbox = xQueueCreate(1, sizeof(Sensors::OpticalFlowReading));
 
     xTaskCreate(core0_system_task, "TempTask", 256, NULL, 1, &core0_task_handle);
 
     //xTaskCreate(core1_flight_task, "ClockTask", 256, NULL, 1, &core1_task_handle);
 
     xTaskCreate(core0_elrs_task, "ELRSTask", 256, NULL, 1, &elrs_task_handle);
+    xTaskCreate(optical_flow_task, "FlowTask", 512, NULL, 1, &optical_flow_task_handle);
     //xTaskCreate(bno085_task, "ImuTask", 1024, NULL, 1, &bno085_task_handle);
     //xTaskCreate(bno085_imu_task, "BnoTask", 1024, NULL, 1, &bno085_task_handle);
     //xTaskCreate(bmp581_task,"BMPTask",1024,NULL,1,&bmp581_task_handle);
@@ -1952,6 +2312,7 @@ int main() {
     xTaskCreate(flight_telemetry_task, "Telemetry", 1024, NULL, 1, &core1_task_handle);
 
     vTaskCoreAffinitySet(elrs_task_handle, (1 << 0));
+    vTaskCoreAffinitySet(optical_flow_task_handle, (1 << 0)); // PIO interrupt on core 0 too
     //vTaskCoreAffinitySet(core0_task_handle, (1 << 0));
     vTaskCoreAffinitySet(core1_task_handle, (1 << 0)); // flight print
     vTaskCoreAffinitySet(bno085_task_handle, (1 << 1)); // flight control

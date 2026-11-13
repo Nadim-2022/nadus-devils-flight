@@ -27,6 +27,7 @@ add_executable(${PROJECT_NAME}
         ../../external/sh2/sh2_SensorValue.c
         filter/AltKalman.cpp
         motor/Motors.cpp
+        pid/Pid.cpp
 
 )
 

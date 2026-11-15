@@ -843,8 +843,8 @@ static constexpr float IMU_PITCH_DIRECTION = -1.0f;
 static constexpr float IMU_YAW_DIRECTION = -1.0f;
 
 // Angle the drone reads when it sits on a level floor
-static constexpr float ROLL_TRIM_DEG = 0.0f;
-static constexpr float PITCH_TRIM_DEG = 0.0f;
+static constexpr float ROLL_TRIM_DEG = 1.9f;
+static constexpr float PITCH_TRIM_DEG = -1.2f;
 
 
 // How much each motor does for roll / pitch / yaw (Quad X)
@@ -868,11 +868,11 @@ static const MotorMix motor_mix[4] =
 };
 
 // Flight limits
-static constexpr float MAX_TILT_ANGLE_DEG = 25.0f; // full stick
+static constexpr float MAX_TILT_ANGLE_DEG = 25.0f; // full stickSticks, disarmed
 static constexpr float MAX_TILT_SPEED_DEG_S = 150.0f; // max output of the angle loop
 static constexpr float MAX_YAW_SPEED_DEG_S = 120.0f; // full yaw stick
 static constexpr float PID_START_THROTTLE = 0.05f; // below this motors idle and PID off
-static constexpr float INTEGRAL_START_THROTTLE = 0.15f; // below this I stays frozen (on the ground)
+static constexpr float INTEGRAL_START_THROTTLE = 0.30f; // below this I stays frozen (on the ground)
 
 // Safety
 static constexpr float ARM_MAX_TILT_DEG = 20.0f;
@@ -898,7 +898,7 @@ static Pid::Settings roll_pitch_speed_pid_settings()
     Pid::Settings settings;
     settings.proportional_gain = 0.0010f;
     settings.integral_gain = 0.0015f;
-    settings.derivative_gain = 0.00002f;
+    settings.derivative_gain = 0.0f;//0.00002f;
     settings.integral_limit = 0.10f;
     settings.output_limit = 0.30f;
     settings.derivative_filter_hz = 40.0f;

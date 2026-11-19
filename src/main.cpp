@@ -86,6 +86,8 @@ enum SerialCmd {
     CMD_NONE = 0,
     CMD_CALIBRATE,   // "cal"
     CMD_STATUS,      // "status"
+    CMD_LOG, // "log"
+    CMD_ESC, // "esc"
     CMD_UNKNOWN
 };
 
@@ -110,6 +112,8 @@ SerialCmd serial_poll_command(void) {
 
             if (strcmp(line, "cal") == 0)    return CMD_CALIBRATE;
             if (strcmp(line, "status") == 0) return CMD_STATUS;
+            if (strcmp(line, "log") == 0) return CMD_LOG;
+            if (strcmp(line, "esc") == 0) return CMD_ESC;
             return CMD_UNKNOWN;
         }
         if (len < sizeof(line) - 1) {
@@ -958,6 +962,79 @@ struct FlightStatus
 static QueueHandle_t status_mailbox;
 
 
+//--------------------Flight log-------------------------//
+// Last 60 s of flying at 50 Hz, kept in RAM, only while armed.
+// Type "log" on the serial console after landing to print it.
+// Saved as int16 (x10 or x1000) so it only takes 72 KB.
+static constexpr int FLIGHT_LOG_SIZE = 3000; // 60 s at 50 Hz
+
+struct FlightLogLine
+{
+    uint32_t time_ms;
+    int16_t throttle; // x1000
+    int16_t motor_power[4]; // x1000
+    int16_t yaw_speed; // deg/s x10
+    int16_t target_yaw_speed; // deg/s x10
+    int16_t roll_deg; // x10
+    int16_t pitch_deg; // x10
+    int16_t yaw_deg; // x10
+};
+
+static FlightLogLine flight_log[FLIGHT_LOG_SIZE];
+static volatile int flight_log_next = 0; // where the next line goes
+static volatile int flight_log_count = 0; // filled lines, stops at FLIGHT_LOG_SIZE
+
+static int16_t to_log_number(float value, float scale)
+{
+    float scaled = value * scale;
+    if (scaled > 32767.0f) scaled = 32767.0f;
+    if (scaled < -32768.0f) scaled = -32768.0f;
+    return (int16_t)lroundf(scaled);
+}
+
+// called from the flight task, oldest line gets overwritten when full
+static void flight_log_add(const FlightStatus &status)
+{
+    FlightLogLine &line = flight_log[flight_log_next];
+    line.time_ms = status.time_ms;
+    line.throttle = to_log_number(status.throttle, 1000.0f);
+    for (int i = 0; i < 4; i++) line.motor_power[i] = to_log_number(status.motor_power[i], 1000.0f);
+    line.yaw_speed = to_log_number(status.yaw_speed, 10.0f);
+    line.target_yaw_speed = to_log_number(status.target_yaw_speed, 10.0f);
+    line.roll_deg = to_log_number(status.roll_deg, 10.0f);
+    line.pitch_deg = to_log_number(status.pitch_deg, 10.0f);
+    line.yaw_deg = to_log_number(status.yaw_deg, 10.0f);
+
+    flight_log_next = (flight_log_next + 1) % FLIGHT_LOG_SIZE;
+    if (flight_log_count < FLIGHT_LOG_SIZE) flight_log_count++;
+}
+
+// oldest line first, time counts from the first line
+// a jump in time = disarmed and armed again
+static void flight_log_print()
+{
+    int count = flight_log_count;
+    int first = (flight_log_next - count + FLIGHT_LOG_SIZE) % FLIGHT_LOG_SIZE;
+    uint32_t start_ms = flight_log[first].time_ms;
+
+    printf("=== FLIGHT LOG START (%d lines) ===\n", count);
+    printf("time_s,throttle,m0_rear_right,m1_front_right,m2_rear_left,m3_front_left,"
+           "yaw_speed,yaw_target,roll,pitch,yaw\n");
+    for (int i = 0; i < count; i++)
+    {
+        const FlightLogLine &line = flight_log[(first + i) % FLIGHT_LOG_SIZE];
+        printf("%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+               (line.time_ms - start_ms) / 1000.0f,
+               line.throttle / 1000.0f,
+               line.motor_power[0] / 1000.0f, line.motor_power[1] / 1000.0f,
+               line.motor_power[2] / 1000.0f, line.motor_power[3] / 1000.0f,
+               line.yaw_speed / 10.0f, line.target_yaw_speed / 10.0f,
+               line.roll_deg / 10.0f, line.pitch_deg / 10.0f, line.yaw_deg / 10.0f);
+    }
+    printf("=== FLIGHT LOG END ===\n");
+}
+
+
 // Centre stick -> -1 .. +1 with a small dead band
 static float stick_position(uint16_t value)
 {
@@ -1345,6 +1422,8 @@ void flight_control_task(void *pvParameters)
             status.time_ms = now_ms;
 
             xQueueOverwrite(status_mailbox, &status);
+
+            if (armed) flight_log_add(status);
         }
     }
 }
@@ -1399,7 +1478,82 @@ void flight_telemetry_task(void *pvParameters)
                 printf("\n");
             }
         }
+
+        if (serial_poll_command() == CMD_LOG)
+        {
+            // not while flying, printing it all takes a while
+            if (was_armed)
+            {
+                printf("Disarm first to print the log\n");
+            }
+            else
+            {
+                flight_log_print();
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+
+// ========================================================
+// ESC CALIBRATION
+// Sends max pulse (2000 us), then min pulse (1000 us) so the ESCs learn the range.
+// Runs instead of the flight task, set ESC_CALIBRATION_MODE to true to use it.
+// PROPS OFF. Start with the battery unplugged, Pico on USB.
+// ========================================================
+static constexpr bool ESC_CALIBRATION_MODE = false;
+
+static void wait_for_esc_command()
+{
+    while (serial_poll_command() != CMD_ESC)
+    {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void esc_calibration_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    Motors::Config motor_config;
+    motor_config.pins[0] = MOTOR0_PIN;
+    motor_config.pins[1] = MOTOR1_PIN;
+    motor_config.pins[2] = MOTOR2_PIN;
+    motor_config.pins[3] = MOTOR3_PIN;
+    motor_config.count = 4;
+    static Motors motors(motor_config);
+
+    if (!motors.begin())
+    {
+        printf("Motors error: %s\n", motors.lastError());
+        vTaskDelete(NULL);
+    }
+
+    printf("\n=== ESC CALIBRATION ===\n");
+    printf("PROPS OFF, battery unplugged\n");
+    printf("Type esc to send max pulse\n");
+    wait_for_esc_command();
+
+    // arm so setAll can go above the stop pulse, 1.0 = max_us
+    motors.arm();
+    motors.setAll(1.0f);
+    printf("Max pulse on all motors (%u us)\n", motors.pulseUs(0));
+    printf("Plug in the battery now, wait for the beeps\n");
+    printf("Then type esc to send min pulse\n");
+    wait_for_esc_command();
+
+    // disarm = min_us on all motors
+    motors.disarm();
+    printf("Min pulse on all motors (%u us)\n", motors.pulseUs(0));
+    printf("Wait for the confirm beeps, then unplug the battery\n");
+    printf("Set ESC_CALIBRATION_MODE back to false and flash again\n");
+
+    // keep the stop pulse going
+    while (true)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -1443,14 +1597,22 @@ int main() {
     //xTaskCreate(bmp581_task,"BMPTask",1024,NULL,1,&bmp581_task_handle);
     //xTaskCreate(motor_task, "MotorTest", 1024, NULL, 1, &motor_test_handle);
 
-    // flight task uses bno085_task_handle so bno_int_isr wakes it
-    xTaskCreate(flight_control_task, "Flight", 2048, NULL, 3, &bno085_task_handle);
-    xTaskCreate(flight_telemetry_task, "Telemetry", 1024, NULL, 1, &core1_task_handle);
+    if (ESC_CALIBRATION_MODE)
+    {
+        // no flight task, only ESC calibration
+        xTaskCreate(esc_calibration_task, "EscCal", 1024, NULL, 2, &motor_test_handle);
+    }
+    else
+    {
+        // flight task uses bno085_task_handle so bno_int_isr wakes it
+        xTaskCreate(flight_control_task, "Flight", 2048, NULL, 3, &bno085_task_handle);
+        xTaskCreate(flight_telemetry_task, "Telemetry", 1024, NULL, 1, &core1_task_handle);
+        vTaskCoreAffinitySet(core1_task_handle, (1 << 0)); // flight print
+        vTaskCoreAffinitySet(bno085_task_handle, (1 << 1)); // flight control
+    }
 
     vTaskCoreAffinitySet(elrs_task_handle, (1 << 0));
     //vTaskCoreAffinitySet(core0_task_handle, (1 << 0));
-    vTaskCoreAffinitySet(core1_task_handle, (1 << 0)); // flight print
-    vTaskCoreAffinitySet(bno085_task_handle, (1 << 1)); // flight control
     //vTaskCoreAffinitySet(bmp581_task_handle, (1 << 1));
     //vTaskCoreAffinitySet(motor_test_handle, (1 << 1));
 

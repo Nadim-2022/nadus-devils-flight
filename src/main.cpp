@@ -88,6 +88,7 @@ enum SerialCmd {
     CMD_STATUS,      // "status"
     CMD_LOG, // "log"
     CMD_ESC, // "esc"
+    CMD_LEVEL, // "level"
     CMD_UNKNOWN
 };
 
@@ -114,6 +115,7 @@ SerialCmd serial_poll_command(void) {
             if (strcmp(line, "status") == 0) return CMD_STATUS;
             if (strcmp(line, "log") == 0) return CMD_LOG;
             if (strcmp(line, "esc") == 0) return CMD_ESC;
+            if (strcmp(line, "level") == 0) return CMD_LEVEL;
             return CMD_UNKNOWN;
         }
         if (len < sizeof(line) - 1) {
@@ -847,8 +849,20 @@ static constexpr float IMU_PITCH_DIRECTION = -1.0f;
 static constexpr float IMU_YAW_DIRECTION = -1.0f;
 
 // Angle the drone reads when it sits on a level floor
-static constexpr float ROLL_TRIM_DEG = 1.9f;
-static constexpr float PITCH_TRIM_DEG = -1.2f;
+// used at power up, "level" or the stick move below measures new ones
+static constexpr float ROLL_TRIM_DEG = 0.7f;
+static constexpr float PITCH_TRIM_DEG = 0.5f;
+
+// Level on the floor without a cable plugged in (cable moves the soft mount):
+// disarmed, throttle down, yaw full left + pitch full back for 1 s
+static constexpr uint32_t LEVEL_STICK_HOLD_MS = 1000;
+static constexpr uint32_t LEVEL_MEASURE_MS = 2000;
+static constexpr float LEVEL_MAX_TILT_DEG = 10.0f; // more than this = not on the floor
+static constexpr float LEVEL_MAX_MOVING_DEG_S = 5.0f; // drone has to sit still
+
+static float roll_trim_deg = ROLL_TRIM_DEG;
+static float pitch_trim_deg = PITCH_TRIM_DEG;
+static volatile bool level_requested = false; // set by the "level" command
 
 
 // How much each motor does for roll / pitch / yaw (Quad X)
@@ -877,12 +891,16 @@ static constexpr float MAX_TILT_SPEED_DEG_S = 150.0f; // max output of the angle
 static constexpr float MAX_YAW_SPEED_DEG_S = 120.0f; // full yaw stick
 static constexpr float PID_START_THROTTLE = 0.05f; // below this motors idle and PID off
 static constexpr float INTEGRAL_START_THROTTLE = 0.30f; // below this I stays frozen (on the ground)
+static constexpr float YAW_INTEGRAL_START_THROTTLE = 0.10f; // yaw can't wind up on the ground, the feet stop it turning
 
 // Safety
 static constexpr float ARM_MAX_TILT_DEG = 20.0f;
 static constexpr float CRASH_TILT_DEG = 60.0f;
 static constexpr float ARM_MAX_THROTTLE = 0.05f;
 static constexpr uint32_t IMU_TIMEOUT_US = 100000; // 100 ms
+static constexpr float MAX_ATTITUDE_JUMP_DEG = 10.0f; // roll / pitch can't move this much between two readings
+static constexpr float GYRO_FILTER_HZ = 40.0f; // low pass on the gyro, takes out the vibration
+static constexpr uint32_t GYRO_ONLY_MAX_US = 3000000; // 3 s flying on gyro angles when the BNO angle is lost
 static constexpr uint32_t ESC_STARTUP_MS = 4000;
 
 
@@ -892,7 +910,7 @@ static constexpr uint32_t ESC_STARTUP_MS = 4000;
 static Pid::Settings angle_pid_settings()
 {
     Pid::Settings settings;
-    settings.proportional_gain = 4.0f;
+    settings.proportional_gain = 6.0f;
     settings.output_limit = MAX_TILT_SPEED_DEG_S;
     return settings;
 }
@@ -928,6 +946,7 @@ enum DisarmReason : uint8_t
     DISARM_FAILSAFE,
     DISARM_IMU_TIMEOUT,
     DISARM_CRASH_TILT,
+    DISARM_IMU_LOST,
 };
 
 static const char *disarm_reason_text(uint8_t reason)
@@ -938,6 +957,7 @@ static const char *disarm_reason_text(uint8_t reason)
         case DISARM_FAILSAFE: return "FAILSAFE: RC link lost";
         case DISARM_IMU_TIMEOUT: return "IMU stopped sending";
         case DISARM_CRASH_TILT: return "CRASH: tilt over limit";
+        case DISARM_IMU_LOST: return "IMU angle lost too long";
         default: return "-";
     }
 }
@@ -957,16 +977,21 @@ struct FlightStatus
     float compass_deg;
     uint16_t loop_hz;
     uint32_t time_ms;
+    float roll_trim, pitch_trim;
+    bool levelling;
+    uint8_t imu_resets; // BNO085 restarted by itself
+    uint8_t bad_imu_reads; // rotation vectors thrown away
 };
 
 static QueueHandle_t status_mailbox;
 
 
 //--------------------Flight log-------------------------//
-// Last 60 s of flying at 50 Hz, kept in RAM, only while armed.
+// Last 60 s of flying at 50 Hz, kept in RAM, while armed and 3 s after disarm.
 // Type "log" on the serial console after landing to print it.
-// Saved as int16 (x10 or x1000) so it only takes 72 KB.
+// Saved as int16 (x10 or x1000) so it only takes 96 KB.
 static constexpr int FLIGHT_LOG_SIZE = 3000; // 60 s at 50 Hz
+static constexpr uint32_t LOG_AFTER_DISARM_MS = 3000; // to see the angles settle after landing
 
 struct FlightLogLine
 {
@@ -978,6 +1003,10 @@ struct FlightLogLine
     int16_t roll_deg; // x10
     int16_t pitch_deg; // x10
     int16_t yaw_deg; // x10
+    int16_t roll_speed; // deg/s x10
+    int16_t pitch_speed; // deg/s x10
+    uint8_t imu_resets;
+    uint8_t bad_imu_reads;
 };
 
 static FlightLogLine flight_log[FLIGHT_LOG_SIZE];
@@ -1004,6 +1033,10 @@ static void flight_log_add(const FlightStatus &status)
     line.roll_deg = to_log_number(status.roll_deg, 10.0f);
     line.pitch_deg = to_log_number(status.pitch_deg, 10.0f);
     line.yaw_deg = to_log_number(status.yaw_deg, 10.0f);
+    line.roll_speed = to_log_number(status.roll_speed, 10.0f);
+    line.pitch_speed = to_log_number(status.pitch_speed, 10.0f);
+    line.imu_resets = status.imu_resets;
+    line.bad_imu_reads = status.bad_imu_reads;
 
     flight_log_next = (flight_log_next + 1) % FLIGHT_LOG_SIZE;
     if (flight_log_count < FLIGHT_LOG_SIZE) flight_log_count++;
@@ -1019,17 +1052,19 @@ static void flight_log_print()
 
     printf("=== FLIGHT LOG START (%d lines) ===\n", count);
     printf("time_s,throttle,m0_rear_right,m1_front_right,m2_rear_left,m3_front_left,"
-           "yaw_speed,yaw_target,roll,pitch,yaw\n");
+           "yaw_speed,yaw_target,roll,pitch,yaw,roll_speed,pitch_speed,imu_resets,bad_imu_reads\n");
     for (int i = 0; i < count; i++)
     {
         const FlightLogLine &line = flight_log[(first + i) % FLIGHT_LOG_SIZE];
-        printf("%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%.1f,%.1f,%.1f\n",
+        printf("%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%u,%u\n",
                (line.time_ms - start_ms) / 1000.0f,
                line.throttle / 1000.0f,
                line.motor_power[0] / 1000.0f, line.motor_power[1] / 1000.0f,
                line.motor_power[2] / 1000.0f, line.motor_power[3] / 1000.0f,
                line.yaw_speed / 10.0f, line.target_yaw_speed / 10.0f,
-               line.roll_deg / 10.0f, line.pitch_deg / 10.0f, line.yaw_deg / 10.0f);
+               line.roll_deg / 10.0f, line.pitch_deg / 10.0f, line.yaw_deg / 10.0f,
+               line.roll_speed / 10.0f, line.pitch_speed / 10.0f,
+               line.imu_resets, line.bad_imu_reads);
     }
     printf("=== FLIGHT LOG END ===\n");
 }
@@ -1139,6 +1174,20 @@ void flight_control_task(void *pvParameters)
     float roll_deg = 0.0f, pitch_deg = 0.0f, yaw_deg = 0.0f;
     float roll_speed = 0.0f, pitch_speed = 0.0f, yaw_speed = 0.0f; // deg/s
     float compass_deg = 0.0f;
+    float untrimmed_roll = 0.0f, untrimmed_pitch = 0.0f;
+    uint8_t imu_resets = 0, bad_imu_reads = 0;
+    uint64_t last_gyro_timestamp = 0;
+
+    // BNO angle lost, angles come from the gyro for a while
+    bool gyro_only = false;
+    uint32_t gyro_only_since_us = 0;
+
+    // level measuring
+    bool levelling = false;
+    uint32_t level_sticks_since_ms = 0; // 0 = sticks not in the level spot
+    uint32_t level_start_ms = 0;
+    float level_roll_sum = 0.0f, level_pitch_sum = 0.0f;
+    int level_samples = 0;
 
     uint32_t last_attitude_us = 0, last_gyro_us = 0, last_control_us = 0;
     bool have_attitude = false, have_gyro = false;
@@ -1154,6 +1203,8 @@ void flight_control_task(void *pvParameters)
     float motor_power[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     uint32_t loop_count = 0, loop_hz = 0, last_hz_ms = 0, last_status_ms = 0;
+    uint32_t last_armed_ms = 0;
+    bool was_ever_armed = false;
 
 
     while (true)
@@ -1165,26 +1216,57 @@ void flight_control_task(void *pvParameters)
         {
             DEBUG_PRINTF("Sensor was reset\n");
             enable_flight_reports(bno);
+            if (imu_resets < 255) imu_resets++;
         }
 
         bool new_attitude = false;
+        bool new_gyro = false;
         while (bno.getSensorEvent(&value))
         {
             if (value.sensorId == SH2_GAME_ROTATION_VECTOR)
             {
-                qr = value.un.gameRotationVector.real;
-                qi = value.un.gameRotationVector.i;
-                qj = value.un.gameRotationVector.j;
-                qk = value.un.gameRotationVector.k;
-                new_attitude = true;
+                float new_qr = value.un.gameRotationVector.real;
+                float new_qi = value.un.gameRotationVector.i;
+                float new_qj = value.un.gameRotationVector.j;
+                float new_qk = value.un.gameRotationVector.k;
+
+                // a good rotation vector has length 1, anything far off is a bad read
+                float length = new_qr * new_qr + new_qi * new_qi + new_qj * new_qj + new_qk * new_qk;
+                if (length > 0.9f && length < 1.1f)
+                {
+                    qr = new_qr;
+                    qi = new_qi;
+                    qj = new_qj;
+                    qk = new_qk;
+                    new_attitude = true;
+                }
+                else if (bad_imu_reads < 255)
+                {
+                    bad_imu_reads++;
+                }
             }
             else if (value.sensorId == SH2_GYROSCOPE_CALIBRATED)
             {
-                gyro_x = value.un.gyroscope.x;
-                gyro_y = value.un.gyroscope.y;
-                gyro_z = value.un.gyroscope.z;
+                // low pass, the drone moves slow, the vibration is fast
+                float gyro_step = (float)(value.timestamp - last_gyro_timestamp) * 1e-6f;
+                last_gyro_timestamp = value.timestamp;
+                if (!have_gyro || gyro_step <= 0.0f || gyro_step > 0.02f) gyro_step = 0.0025f;
+                float smoothing = gyro_step / (gyro_step + 1.0f / (2.0f * 3.14159265f * GYRO_FILTER_HZ));
+
+                gyro_x += smoothing * (value.un.gyroscope.x - gyro_x);
+                gyro_y += smoothing * (value.un.gyroscope.y - gyro_y);
+                gyro_z += smoothing * (value.un.gyroscope.z - gyro_z);
+
+                // keep the angles moving with the gyro while the BNO angle is bad
+                if (gyro_only)
+                {
+                    untrimmed_roll += IMU_ROLL_DIRECTION * value.un.gyroscope.x * RAD2DEG * gyro_step;
+                    untrimmed_pitch += IMU_PITCH_DIRECTION * value.un.gyroscope.y * RAD2DEG * gyro_step;
+                    yaw_deg += IMU_YAW_DIRECTION * value.un.gyroscope.z * RAD2DEG * gyro_step;
+                }
                 last_gyro_us = time_us_32();
                 have_gyro = true;
+                new_gyro = true;
             }
             else if (value.sensorId == SH2_ROTATION_VECTOR)
             {
@@ -1215,13 +1297,43 @@ void flight_control_task(void *pvParameters)
             float bno_yaw = atan2f(2.0f * (qr * qk + qi * qj),
                                      1.0f - 2.0f * (qj * qj + qk * qk)) * RAD2DEG;
 
-            roll_deg = IMU_ROLL_DIRECTION * bno_roll - ROLL_TRIM_DEG;
-            pitch_deg = IMU_PITCH_DIRECTION * bno_pitch - PITCH_TRIM_DEG;
-            yaw_deg = IMU_YAW_DIRECTION * bno_yaw;
+            float new_roll = IMU_ROLL_DIRECTION * bno_roll;
+            float new_pitch = IMU_PITCH_DIRECTION * bno_pitch;
 
-            last_attitude_us = now_us;
-            have_attitude = true;
-            loop_count++;
+            // BNO lost its angle (vibration), the drone can't jump like that.
+            // Fly on the gyro angles until the BNO agrees again (max GYRO_ONLY_MAX_US).
+            bool jumped = armed && have_attitude &&
+                          (fabsf(new_roll - untrimmed_roll) > MAX_ATTITUDE_JUMP_DEG ||
+                           fabsf(new_pitch - untrimmed_pitch) > MAX_ATTITUDE_JUMP_DEG);
+            if (jumped)
+            {
+                new_attitude = false;
+                if (bad_imu_reads < 255) bad_imu_reads++;
+                if (!gyro_only)
+                {
+                    gyro_only = true;
+                    gyro_only_since_us = now_us;
+                }
+            }
+            else
+            {
+                gyro_only = false;
+                untrimmed_roll = new_roll;
+                untrimmed_pitch = new_pitch;
+                roll_deg = untrimmed_roll - roll_trim_deg;
+                pitch_deg = untrimmed_pitch - pitch_trim_deg;
+                yaw_deg = IMU_YAW_DIRECTION * bno_yaw;
+
+                last_attitude_us = now_us;
+                have_attitude = true;
+                loop_count++;
+            }
+        }
+
+        if (gyro_only)
+        {
+            roll_deg = untrimmed_roll - roll_trim_deg;
+            pitch_deg = untrimmed_pitch - pitch_trim_deg;
         }
 
         roll_speed = IMU_ROLL_DIRECTION * gyro_x * RAD2DEG;
@@ -1238,16 +1350,76 @@ void flight_control_task(void *pvParameters)
 
         if (link_ok && rc.ch[CH_ARM] <= CH_MID) arm_switch_was_off = true;
 
+        bool gyro_only_ok = gyro_only && (now_us - gyro_only_since_us) < GYRO_ONLY_MAX_US;
         bool imu_ok = have_attitude && have_gyro &&
-                      (now_us - last_attitude_us) < IMU_TIMEOUT_US &&
+                      ((now_us - last_attitude_us) < IMU_TIMEOUT_US || gyro_only_ok) &&
                       (now_us - last_gyro_us) < IMU_TIMEOUT_US;
+
+        //--------------------Level-------------------------//
+        // sticks: throttle down, yaw full left, pitch full back, arm switch off
+        bool level_sticks = link_ok && !arm_switch && throttle < ARM_MAX_THROTTLE &&
+                            YAW_STICK_DIRECTION * stick_position(rc.ch[CH_YAW]) < -0.9f &&
+                            PITCH_STICK_DIRECTION * stick_position(rc.ch[CH_PITCH]) < -0.9f;
+        if (!level_sticks)
+        {
+            level_sticks_since_ms = 0;
+        }
+        else if (level_sticks_since_ms == 0)
+        {
+            level_sticks_since_ms = now_ms;
+        }
+
+        bool start_level = level_requested ||
+                           (level_sticks_since_ms != 0 && now_ms - level_sticks_since_ms >= LEVEL_STICK_HOLD_MS);
+        if (!armed && !levelling && start_level && have_attitude)
+        {
+            levelling = true;
+            level_start_ms = now_ms;
+            level_roll_sum = 0.0f;
+            level_pitch_sum = 0.0f;
+            level_samples = 0;
+            level_sticks_since_ms = 0;
+            DEBUG_PRINTF("Levelling, keep the drone still\n");
+        }
+        level_requested = false;
+
+        if (levelling && new_attitude)
+        {
+            bool moving = fabsf(roll_speed) > LEVEL_MAX_MOVING_DEG_S || fabsf(pitch_speed) > LEVEL_MAX_MOVING_DEG_S;
+            bool tilted = fabsf(untrimmed_roll) > LEVEL_MAX_TILT_DEG || fabsf(untrimmed_pitch) > LEVEL_MAX_TILT_DEG;
+            if (moving || tilted)
+            {
+                // start again once it sits still
+                level_start_ms = now_ms;
+                level_roll_sum = 0.0f;
+                level_pitch_sum = 0.0f;
+                level_samples = 0;
+            }
+            else
+            {
+                level_roll_sum += untrimmed_roll;
+                level_pitch_sum += untrimmed_pitch;
+                level_samples++;
+            }
+
+            if (now_ms - level_start_ms >= LEVEL_MEASURE_MS && level_samples > 0)
+            {
+                roll_trim_deg = level_roll_sum / level_samples;
+                pitch_trim_deg = level_pitch_sum / level_samples;
+                levelling = false;
+            }
+        }
 
         //--------------------Arm / Disarm-------------------------//
         const char *arm_blocked_by = nullptr;
 
         if (!armed)
         {
-            if (now_ms - motors_start_ms < ESC_STARTUP_MS)
+            if (levelling)
+            {
+                arm_blocked_by = "levelling";
+            }
+            else if (now_ms - motors_start_ms < ESC_STARTUP_MS)
             {
                 arm_blocked_by = "ESCs starting";
             }
@@ -1294,7 +1466,7 @@ void flight_control_task(void *pvParameters)
             }
             else if (!imu_ok)
             {
-                reason = DISARM_IMU_TIMEOUT;
+                reason = gyro_only ? DISARM_IMU_LOST : DISARM_IMU_TIMEOUT;
             }
             else if (fabsf(roll_deg) > CRASH_TILT_DEG || fabsf(pitch_deg) > CRASH_TILT_DEG)
             {
@@ -1313,8 +1485,8 @@ void flight_control_task(void *pvParameters)
         }
 
         //--------------------Control-------------------------//
-        // once per new attitude
-        if (armed && new_attitude)
+        // once per new attitude, or per gyro reading when flying on gyro angles
+        if (armed && (new_attitude || (gyro_only && new_gyro)))
         {
             float time_step = (now_us - last_control_us) * 1e-6f;
             last_control_us = now_us;
@@ -1338,7 +1510,7 @@ void flight_control_task(void *pvParameters)
                 bool freeze_integral = (throttle < INTEGRAL_START_THROTTLE) || motors_at_limit;
                 roll_speed_pid.hold_integral(freeze_integral);
                 pitch_speed_pid.hold_integral(freeze_integral);
-                yaw_speed_pid.hold_integral(freeze_integral);
+                yaw_speed_pid.hold_integral((throttle < YAW_INTEGRAL_START_THROTTLE) || motors_at_limit);
 
                 // angle -> wanted tilt speed
                 float target_roll_speed = roll_angle_pid.calculate(target_roll, roll_deg, time_step);
@@ -1420,10 +1592,23 @@ void flight_control_task(void *pvParameters)
             status.compass_deg = compass_deg;
             status.loop_hz = (uint16_t)loop_hz;
             status.time_ms = now_ms;
+            status.roll_trim = roll_trim_deg;
+            status.pitch_trim = pitch_trim_deg;
+            status.levelling = levelling;
+            status.imu_resets = imu_resets;
+            status.bad_imu_reads = bad_imu_reads;
 
             xQueueOverwrite(status_mailbox, &status);
 
-            if (armed) flight_log_add(status);
+            if (armed)
+            {
+                last_armed_ms = now_ms;
+                was_ever_armed = true;
+            }
+            if (armed || (was_ever_armed && now_ms - last_armed_ms < LOG_AFTER_DISARM_MS))
+            {
+                flight_log_add(status);
+            }
         }
     }
 }
@@ -1439,7 +1624,9 @@ void flight_telemetry_task(void *pvParameters)
 
     FlightStatus status;
     bool was_armed = false;
+    bool was_levelling = false;
     uint8_t last_reason = DISARM_NONE;
+    uint8_t last_imu_resets = 0, last_bad_imu_reads = 0;
     uint32_t last_print_ms = 0;
 
     while (true)
@@ -1462,6 +1649,20 @@ void flight_telemetry_task(void *pvParameters)
             was_armed = status.armed;
             last_reason = status.disarm_reason;
 
+            if (was_levelling && !status.levelling)
+            {
+                printf(">>> LEVEL SET: ROLL_TRIM_DEG = %.1ff, PITCH_TRIM_DEG = %.1ff\n",
+                       status.roll_trim, status.pitch_trim);
+            }
+            was_levelling = status.levelling;
+
+            if (status.imu_resets != last_imu_resets || status.bad_imu_reads != last_bad_imu_reads)
+            {
+                printf(">>> IMU: %u resets, %u bad reads\n", status.imu_resets, status.bad_imu_reads);
+                last_imu_resets = status.imu_resets;
+                last_bad_imu_reads = status.bad_imu_reads;
+            }
+
             uint32_t now_ms = to_ms_since_boot(get_absolute_time());
             if (now_ms - last_print_ms >= 250) // 4 Hz
             {
@@ -1479,7 +1680,20 @@ void flight_telemetry_task(void *pvParameters)
             }
         }
 
-        if (serial_poll_command() == CMD_LOG)
+        SerialCmd command = serial_poll_command();
+        if (command == CMD_LEVEL)
+        {
+            if (was_armed)
+            {
+                printf("Disarm first to level\n");
+            }
+            else
+            {
+                printf("Levelling for 2 s, keep the drone still on a level floor\n");
+                level_requested = true;
+            }
+        }
+        else if (command == CMD_LOG)
         {
             // not while flying, printing it all takes a while
             if (was_armed)

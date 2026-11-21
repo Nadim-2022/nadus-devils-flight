@@ -96,8 +96,12 @@ private:
   uint _cs, _int;
   int _reset, _wake;
  
-  sh2_SensorValue_t *_sensorValue = nullptr;
-  volatile bool _gotEvent = false;
+  // one SPI packet can carry several reports (gyro + rotation vector),
+  // they wait here so none get overwritten
+  static constexpr int REPORT_QUEUE_SIZE = 12;
+  sh2_SensorValue_t report_queue[REPORT_QUEUE_SIZE];
+  int report_queue_first = 0;
+  int report_queue_count = 0;
   volatile bool _resetOccurred = false;
  
   // A packet the sensor sent while we were writing (SPI is full duplex).

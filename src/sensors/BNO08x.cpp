@@ -114,13 +114,18 @@ bool BNO08x::wasReset(void) {
  * @return true if `value` was filled with a new report
  */
 bool BNO08x::getSensorEvent(sh2_SensorValue_t *value) {
-  _sensorValue = value;
-  _gotEvent = false;
- 
-  sh2_service();
- 
-  _sensorValue = nullptr;
-  return _gotEvent;
+  // read a new packet only when the queue is empty
+  if (report_queue_count == 0) {
+    sh2_service();
+  }
+  if (report_queue_count == 0) {
+    return false;
+  }
+
+  *value = report_queue[report_queue_first];
+  report_queue_first = (report_queue_first + 1) % REPORT_QUEUE_SIZE;
+  report_queue_count--;
+  return true;
 }
 
 
@@ -420,13 +425,15 @@ void BNO08x::asyncCallback(void *cookie, sh2_AsyncEvent_t *pEvent) {
  
 void BNO08x::sensorCallback(void *cookie, sh2_SensorEvent_t *event) {
   BNO08x *dev = static_cast<BNO08x *>(cookie);
-  if (!dev->_sensorValue) {
-    return;
+  if (dev->report_queue_count >= REPORT_QUEUE_SIZE) {
+    return; // queue full, drop the newest
   }
-  if (sh2_decodeSensorEvent(dev->_sensorValue, event) != SH2_OK) {
+
+  int slot = (dev->report_queue_first + dev->report_queue_count) % REPORT_QUEUE_SIZE;
+  if (sh2_decodeSensorEvent(&dev->report_queue[slot], event) != SH2_OK) {
     printf("BNO08x - Error decoding sensor event\n");
     return;
   }
-  dev->_gotEvent = true;
+  dev->report_queue_count++;
 }
  

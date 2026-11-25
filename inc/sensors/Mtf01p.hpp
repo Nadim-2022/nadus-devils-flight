@@ -60,6 +60,7 @@ namespace Sensors
             bool read_frame();
             uint32_t get_bad_frames() const { return bad_frames; }
             uint32_t get_lost_bytes() const { return lost_bytes; }
+            uint32_t get_received_bytes() const { return received_bytes; }
 
             OpticalFlowReading reading;
 
@@ -92,6 +93,7 @@ namespace Sensors
             volatile uint8_t ring_write = 0;
             volatile uint8_t ring_read = 0;
             volatile uint32_t lost_bytes = 0;
+            volatile uint32_t received_bytes = 0; // every byte the PIO got, to see if the wire works
 
             MicolinkState state = MicolinkState::WAIT_FOR_HEADER;
             uint8_t frame[6 + MAX_PAYLOAD_LENGTH];

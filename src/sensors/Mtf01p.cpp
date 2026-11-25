@@ -57,6 +57,7 @@ namespace Sensors
         while (!pio_sm_is_rx_fifo_empty(sensor->pio, sensor->state_machine))
         {
             uint8_t rx_byte = (uint8_t)(pio_sm_get(sensor->pio, sensor->state_machine) >> 24);
+            sensor->received_bytes++;
             uint8_t next_write = sensor->ring_write + 1;
             if (next_write == sensor->ring_read)
             {
